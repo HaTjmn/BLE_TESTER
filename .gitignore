@@ -1,0 +1,9 @@
+.pio/
+build/
+sdkconfig.*
+!sdkconfig.defaults
+*.log
+tools/logs/
+test/host/logs/
+__pycache__/
+*.pyc

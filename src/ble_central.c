@@ -1,0 +1,802 @@
+#include "ble_central.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_uuid.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "store/config/ble_store_config.h"
+#include "host/ble_store.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+
+/* ---------------------------------------------------------------------
+ * State
+ * ------------------------------------------------------------------- */
+
+static ble_central_state_t s_state = BLE_CENTRAL_STATE_IDLE;
+static uint8_t  s_own_addr_type;
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_mtu = 23;
+static char     s_peer_addr_str[18] = {0};
+static char     s_peer_name[32] = {0};
+
+static ble_central_service_t        s_services[BLE_CENTRAL_MAX_SERVICES];
+static int                          s_service_count = 0;
+static ble_central_characteristic_t s_chrs[BLE_CENTRAL_MAX_CHARACTERISTICS];
+static int                          s_chr_count = 0;
+
+/* One pending async operation. `generation` is bumped every time a new
+ * one starts; any in-flight NimBLE callback captures its own generation
+ * at start time and is discarded if it no longer matches -- this is how
+ * a late completion after a timeout is safely ignored without needing
+ * to truly cancel the underlying NimBLE procedure. */
+typedef struct {
+    bool             active;
+    uint32_t         generation;
+    ble_central_op_t op;
+    int64_t          request_id;
+    TickType_t       deadline_tick;
+    /* op-specific scratch */
+    char             name_filter[32];
+    char             addr_filter[18];
+    char             service_uuid_filter[BLE_CENTRAL_UUID_STR_LEN];
+    int              scan_results_count;
+    char             connect_name[32];
+    uint16_t         target_val_handle;
+    uint8_t          write_buf[BLE_CENTRAL_MAX_READ_LEN];
+    size_t           write_len;
+} pending_op_t;
+
+static pending_op_t s_pending = {0};
+static TimerHandle_t s_timeout_timer;
+
+/* ---------------------------------------------------------------------
+ * UUID / address helpers
+ * ------------------------------------------------------------------- */
+
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool uuid_str_to_ble_uuid(const char *str, ble_uuid_any_t *out)
+{
+    size_t len = strlen(str);
+    if (len == 4) {
+        int b3 = hex_val(str[0]), b2 = hex_val(str[1]), b1 = hex_val(str[2]), b0 = hex_val(str[3]);
+        if (b3 < 0 || b2 < 0 || b1 < 0 || b0 < 0) return false;
+        out->u.type = BLE_UUID_TYPE_16;
+        out->u16.value = (uint16_t)((b3 << 12) | (b2 << 8) | (b1 << 4) | b0);
+        return true;
+    }
+    if (len == 36 && str[8] == '-' && str[13] == '-' && str[18] == '-' && str[23] == '-') {
+        uint8_t bytes[16];
+        int bi = 0;
+        for (size_t i = 0; i < len; i++) {
+            if (str[i] == '-') continue;
+            int hi = hex_val(str[i]);
+            i++;
+            int lo = hex_val(str[i]);
+            if (hi < 0 || lo < 0 || bi >= 16) return false;
+            bytes[bi++] = (uint8_t)((hi << 4) | lo);
+        }
+        if (bi != 16) return false;
+        out->u.type = BLE_UUID_TYPE_128;
+        for (int i = 0; i < 16; i++) {
+            out->u128.value[i] = bytes[15 - i];
+        }
+        return true;
+    }
+    return false;
+}
+
+static void ble_uuid_to_uuid_str(const ble_uuid_any_t *u, char *out, size_t cap)
+{
+    if (u->u.type == BLE_UUID_TYPE_16) {
+        snprintf(out, cap, "%04x", u->u16.value);
+    } else if (u->u.type == BLE_UUID_TYPE_128) {
+        const uint8_t *v = u->u128.value;
+        snprintf(out, cap, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 v[15], v[14], v[13], v[12], v[11], v[10], v[9], v[8],
+                 v[7], v[6], v[5], v[4], v[3], v[2], v[1], v[0]);
+    } else {
+        snprintf(out, cap, "unsupported-uuid-type");
+    }
+}
+
+static void addr_to_str(const ble_addr_t *addr, char *out, size_t cap)
+{
+    snprintf(out, cap, "%02x:%02x:%02x:%02x:%02x:%02x",
+             addr->val[5], addr->val[4], addr->val[3], addr->val[2], addr->val[1], addr->val[0]);
+}
+
+static bool str_to_addr(const char *str, ble_addr_t *out)
+{
+    unsigned int b[6];
+    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+        return false;
+    }
+    out->val[5] = (uint8_t)b[0];
+    out->val[4] = (uint8_t)b[1];
+    out->val[3] = (uint8_t)b[2];
+    out->val[2] = (uint8_t)b[3];
+    out->val[1] = (uint8_t)b[4];
+    out->val[0] = (uint8_t)b[5];
+    out->type = BLE_ADDR_PUBLIC;
+    return true;
+}
+
+/* ---------------------------------------------------------------------
+ * Pending-op bookkeeping
+ * ------------------------------------------------------------------- */
+
+static uint32_t begin_pending(ble_central_op_t op, int64_t request_id, uint32_t timeout_ms)
+{
+    s_pending.active = true;
+    s_pending.generation++;
+    s_pending.op = op;
+    s_pending.request_id = request_id;
+    s_pending.deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    return s_pending.generation;
+}
+
+static void clear_pending(void)
+{
+    s_pending.active = false;
+}
+
+static bool op_is_current(uint32_t generation)
+{
+    return s_pending.active && s_pending.generation == generation;
+}
+
+static void timeout_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    if (!s_pending.active) return;
+    if (xTaskGetTickCount() < s_pending.deadline_tick) return;
+
+    int64_t id = s_pending.request_id;
+    ble_central_op_t op = s_pending.op;
+    clear_pending();
+
+    if (op == BLE_CENTRAL_OP_SCAN) {
+        ble_gap_disc_cancel();
+        s_state = BLE_CENTRAL_STATE_IDLE;
+    } else if (op == BLE_CENTRAL_OP_CONNECT) {
+        ble_gap_conn_cancel();
+        s_state = BLE_CENTRAL_STATE_IDLE;
+    }
+    /* GATT ops (discovery/read/write/subscribe): nothing to actively
+     * cancel in NimBLE; we just stop waiting. Any late callback will see
+     * a generation mismatch and drop its own result silently. */
+
+    command_dispatcher_on_op_timeout(id);
+}
+
+/* ---------------------------------------------------------------------
+ * GATT callbacks
+ * ------------------------------------------------------------------- */
+
+static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_svc *service, void *arg)
+{
+    (void)conn_handle;
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (!op_is_current(gen)) return 0;
+
+    if (error->status == 0 && service != NULL) {
+        if (s_service_count < BLE_CENTRAL_MAX_SERVICES) {
+            ble_central_service_t *s = &s_services[s_service_count++];
+            ble_uuid_to_uuid_str(&service->uuid, s->uuid, sizeof(s->uuid));
+            s->start_handle = service->start_handle;
+            s->end_handle = service->end_handle;
+        }
+        return 0;
+    }
+
+    int64_t id = s_pending.request_id;
+    clear_pending();
+    if (error->status == BLE_HS_EDONE) {
+        s_state = BLE_CENTRAL_STATE_READY;
+        command_dispatcher_on_svc_disc_done(id, s_services, s_service_count);
+    } else {
+        s_state = BLE_CENTRAL_STATE_CONNECTED;
+        command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "service discovery error");
+    }
+    return 0;
+}
+
+static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)conn_handle;
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (!op_is_current(gen)) return 0;
+
+    if (error->status == 0 && chr != NULL) {
+        if (s_chr_count < BLE_CENTRAL_MAX_CHARACTERISTICS) {
+            ble_central_characteristic_t *c = &s_chrs[s_chr_count++];
+            ble_uuid_to_uuid_str(&chr->uuid, c->uuid, sizeof(c->uuid));
+            c->def_handle = chr->def_handle;
+            c->val_handle = chr->val_handle;
+            c->properties = chr->properties;
+        }
+        return 0;
+    }
+
+    int64_t id = s_pending.request_id;
+    clear_pending();
+    if (error->status == BLE_HS_EDONE) {
+        s_state = BLE_CENTRAL_STATE_READY;
+        command_dispatcher_on_chr_disc_done(id, s_chrs, s_chr_count);
+    } else {
+        s_state = BLE_CENTRAL_STATE_READY;
+        command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "characteristic discovery error");
+    }
+    return 0;
+}
+
+static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                    struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (!op_is_current(gen)) return 0;
+    int64_t id = s_pending.request_id;
+    clear_pending();
+    s_state = BLE_CENTRAL_STATE_READY;
+
+    if (error->status != 0) {
+        command_dispatcher_on_op_error(id, "READ_FAILED", "GATT read error");
+        return 0;
+    }
+    uint16_t len = OS_MBUF_PKTLEN(attr->om);
+    if (len > BLE_CENTRAL_MAX_READ_LEN) len = BLE_CENTRAL_MAX_READ_LEN;
+    uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
+    os_mbuf_copydata(attr->om, 0, len, buf);
+    command_dispatcher_on_read_done(id, buf, len);
+    return 0;
+}
+
+static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                     struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (!op_is_current(gen)) return 0;
+    int64_t id = s_pending.request_id;
+    ble_central_op_t op = s_pending.op;
+    clear_pending();
+    s_state = BLE_CENTRAL_STATE_READY;
+
+    if (error->status != 0) {
+        command_dispatcher_on_op_error(id, "WRITE_FAILED", "GATT write error");
+        return 0;
+    }
+    if (op == BLE_CENTRAL_OP_SUBSCRIBE) {
+        command_dispatcher_on_subscribe_done(id, true);
+    } else if (op == BLE_CENTRAL_OP_UNSUBSCRIBE) {
+        command_dispatcher_on_subscribe_done(id, false);
+    } else {
+        command_dispatcher_on_write_done(id);
+    }
+    return 0;
+}
+
+static int mtu_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                   uint16_t mtu, void *arg)
+{
+    (void)conn_handle; (void)arg;
+    if (error->status == 0) {
+        s_mtu = mtu;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * GAP event callback
+ * ------------------------------------------------------------------- */
+
+static int gap_event_cb(struct ble_gap_event *event, void *arg);
+
+static void report_scan_match(const struct ble_gap_disc_desc *disc)
+{
+    struct ble_hs_adv_fields fields;
+    char addr_str[18];
+    char name_buf[32] = {0};
+
+    ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data);
+    addr_to_str(&disc->addr, addr_str, sizeof(addr_str));
+    if (fields.name != NULL && fields.name_len > 0) {
+        size_t n = fields.name_len < sizeof(name_buf) - 1 ? fields.name_len : sizeof(name_buf) - 1;
+        memcpy(name_buf, fields.name, n);
+        name_buf[n] = '\0';
+    }
+
+    if (s_pending.name_filter[0] != '\0' && strcmp(name_buf, s_pending.name_filter) != 0) {
+        return;
+    }
+    if (s_pending.addr_filter[0] != '\0' && strcasecmp(addr_str, s_pending.addr_filter) != 0) {
+        return;
+    }
+    if (s_pending.service_uuid_filter[0] != '\0') {
+        bool matched = false;
+        for (int i = 0; i < fields.num_uuids128 && !matched; i++) {
+            char u[BLE_CENTRAL_UUID_STR_LEN];
+            ble_uuid_any_t any = { .u128 = fields.uuids128[i] };
+            ble_uuid_to_uuid_str(&any, u, sizeof(u));
+            if (strcasecmp(u, s_pending.service_uuid_filter) == 0) matched = true;
+        }
+        if (!matched) return;
+    }
+
+    s_pending.scan_results_count++;
+    command_dispatcher_on_device_found(addr_str, name_buf, disc->rssi);
+
+    /* connect --name resolves its address via an internal scan phase */
+    if (s_pending.op == BLE_CENTRAL_OP_CONNECT && s_pending.connect_name[0] != '\0' &&
+        strcmp(name_buf, s_pending.connect_name) == 0) {
+        uint32_t gen = s_pending.generation;
+        ble_gap_disc_cancel();
+        struct ble_gap_conn_params conn_params;
+        memset(&conn_params, 0, sizeof(conn_params));
+        conn_params.scan_itvl = 0x0010;
+        conn_params.scan_window = 0x0010;
+        conn_params.itvl_min = 24;
+        conn_params.itvl_max = 40;
+        conn_params.latency = 0;
+        conn_params.supervision_timeout = 256;
+        s_state = BLE_CENTRAL_STATE_CONNECTING;
+        ble_gap_connect(s_own_addr_type, &disc->addr, 10000, &conn_params,
+                         gap_event_cb, (void *)(uintptr_t)gen);
+    }
+}
+
+static int gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_DISC:
+        if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_SCAN) {
+            report_scan_match(&event->disc);
+        } else if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_CONNECT) {
+            report_scan_match(&event->disc);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_SCAN) {
+            int64_t id = s_pending.request_id;
+            int count = s_pending.scan_results_count;
+            clear_pending();
+            s_state = BLE_CENTRAL_STATE_IDLE;
+            command_dispatcher_on_scan_done(id, count);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_CONNECT:
+        if (!op_is_current(gen) || s_pending.op != BLE_CENTRAL_OP_CONNECT) {
+            if (event->connect.status == 0) {
+                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return 0;
+        }
+        {
+            int64_t id = s_pending.request_id;
+            char name_copy[32];
+            strlcpy(name_copy, s_pending.connect_name, sizeof(name_copy));
+            clear_pending();
+
+            if (event->connect.status == 0) {
+                s_conn_handle = event->connect.conn_handle;
+                s_state = BLE_CENTRAL_STATE_CONNECTED;
+                struct ble_gap_conn_desc desc;
+                ble_gap_conn_find(s_conn_handle, &desc);
+                addr_to_str(&desc.peer_id_addr, s_peer_addr_str, sizeof(s_peer_addr_str));
+                strlcpy(s_peer_name, name_copy, sizeof(s_peer_name));
+                ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
+                command_dispatcher_on_connected(id, s_peer_addr_str, s_peer_name);
+            } else {
+                s_state = BLE_CENTRAL_STATE_IDLE;
+                command_dispatcher_on_connect_failed(id, "CONNECT_FAILED", "GAP connect failed");
+            }
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        if (event->disconnect.conn.conn_handle == s_conn_handle) {
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            s_state = BLE_CENTRAL_STATE_IDLE;
+            s_service_count = 0;
+            s_chr_count = 0;
+            s_mtu = 23;
+            if (s_pending.active) {
+                int64_t id = s_pending.request_id;
+                clear_pending();
+                command_dispatcher_on_op_error(id, "DISCONNECTED", "peer disconnected mid-operation");
+            }
+            command_dispatcher_on_disconnected("peer_disconnect");
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        const char *uuid_str = NULL;
+        char uuid_buf[BLE_CENTRAL_UUID_STR_LEN];
+        for (int i = 0; i < s_chr_count; i++) {
+            if (s_chrs[i].val_handle == event->notify_rx.attr_handle) {
+                strlcpy(uuid_buf, s_chrs[i].uuid, sizeof(uuid_buf));
+                uuid_str = uuid_buf;
+                break;
+            }
+        }
+        uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        if (len > BLE_CENTRAL_MAX_READ_LEN) len = BLE_CENTRAL_MAX_READ_LEN;
+        uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
+        os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
+        command_dispatcher_on_notification(event->notify_rx.attr_handle, uuid_str, buf, len,
+                                             event->notify_rx.indication);
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_MTU:
+        s_mtu = event->mtu.value;
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * NimBLE host lifecycle
+ * ------------------------------------------------------------------- */
+
+static void on_reset(int reason)
+{
+    (void)reason;
+    s_state = BLE_CENTRAL_STATE_ERROR;
+}
+
+static void on_sync(void)
+{
+    ble_hs_util_ensure_addr(0);
+    ble_hs_id_infer_auto(0, &s_own_addr_type);
+    s_state = BLE_CENTRAL_STATE_IDLE;
+}
+
+static void host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+void ble_central_init(void)
+{
+    memset(&s_pending, 0, sizeof(s_pending));
+    nimble_port_init();
+
+    ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    /* This NimBLE port's config-store module (unlike upstream Mynewt
+     * NimBLE) has no separate ble_store_config_init() cache-load step --
+     * read/write/delete go straight to NVS on each call. */
+    ble_hs_cfg.store_read_cb = ble_store_config_read;
+    ble_hs_cfg.store_write_cb = ble_store_config_write;
+    ble_hs_cfg.store_delete_cb = ble_store_config_delete;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_device_name_set("holter-test-ctrl");
+
+    s_timeout_timer = xTimerCreate("op_timeout", pdMS_TO_TICKS(200), pdTRUE, NULL, timeout_timer_cb);
+    xTimerStart(s_timeout_timer, 0);
+
+    nimble_port_freertos_init(host_task);
+}
+
+/* ---------------------------------------------------------------------
+ * Public getters
+ * ------------------------------------------------------------------- */
+
+ble_central_state_t ble_central_get_state(void) { return s_state; }
+bool ble_central_is_connected(void) { return s_conn_handle != BLE_HS_CONN_HANDLE_NONE; }
+const char *ble_central_peer_addr_str(void) { return s_peer_addr_str; }
+const char *ble_central_peer_name(void) { return s_peer_name; }
+uint16_t ble_central_negotiated_mtu(void) { return s_mtu; }
+
+uint16_t ble_central_find_char_val_handle(const char *char_uuid)
+{
+    for (int i = 0; i < s_chr_count; i++) {
+        if (strcasecmp(s_chrs[i].uuid, char_uuid) == 0) {
+            return s_chrs[i].val_handle;
+        }
+    }
+    return 0xFFFF;
+}
+
+/* ---------------------------------------------------------------------
+ * Public operations
+ * ------------------------------------------------------------------- */
+
+bool ble_central_scan_start(int64_t request_id, uint32_t timeout_ms,
+                             const char *name_filter, const char *addr_filter,
+                             const char *service_uuid_filter)
+{
+    if (s_pending.active || s_state != BLE_CENTRAL_STATE_IDLE) return false;
+
+    struct ble_gap_disc_params params;
+    memset(&params, 0, sizeof(params));
+    params.passive = 0;
+    params.filter_duplicates = 1;
+    params.itvl = 0x0010;
+    params.window = 0x0010;
+
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_SCAN, request_id, timeout_ms);
+    s_pending.name_filter[0] = '\0';
+    s_pending.addr_filter[0] = '\0';
+    s_pending.service_uuid_filter[0] = '\0';
+    s_pending.scan_results_count = 0;
+    if (name_filter) strlcpy(s_pending.name_filter, name_filter, sizeof(s_pending.name_filter));
+    if (addr_filter) strlcpy(s_pending.addr_filter, addr_filter, sizeof(s_pending.addr_filter));
+    if (service_uuid_filter) strlcpy(s_pending.service_uuid_filter, service_uuid_filter, sizeof(s_pending.service_uuid_filter));
+
+    int rc = ble_gap_disc(s_own_addr_type, timeout_ms, &params, gap_event_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        return false;
+    }
+    s_state = BLE_CENTRAL_STATE_SCANNING;
+    return true;
+}
+
+bool ble_central_scan_stop(void)
+{
+    if (s_state != BLE_CENTRAL_STATE_SCANNING) return false;
+    ble_gap_disc_cancel();
+    return true;
+}
+
+bool ble_central_connect_start(int64_t request_id, uint32_t timeout_ms,
+                                const char *addr, const char *name)
+{
+    if (s_pending.active || s_state != BLE_CENTRAL_STATE_IDLE) return false;
+    if ((addr == NULL || addr[0] == '\0') && (name == NULL || name[0] == '\0')) return false;
+
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_CONNECT, request_id, timeout_ms);
+    s_pending.connect_name[0] = '\0';
+
+    if (addr != NULL && addr[0] != '\0') {
+        ble_addr_t peer;
+        if (!str_to_addr(addr, &peer)) {
+            clear_pending();
+            return false;
+        }
+        struct ble_gap_conn_params conn_params;
+        memset(&conn_params, 0, sizeof(conn_params));
+        conn_params.scan_itvl = 0x0010;
+        conn_params.scan_window = 0x0010;
+        conn_params.itvl_min = 24;
+        conn_params.itvl_max = 40;
+        conn_params.supervision_timeout = 256;
+        int rc = ble_gap_connect(s_own_addr_type, &peer, timeout_ms, &conn_params,
+                                  gap_event_cb, (void *)(uintptr_t)gen);
+        if (rc != 0) {
+            clear_pending();
+            return false;
+        }
+        s_state = BLE_CENTRAL_STATE_CONNECTING;
+        return true;
+    }
+
+    /* Resolve by advertised name: scan first, connect on match (see
+     * report_scan_match()). */
+    strlcpy(s_pending.connect_name, name, sizeof(s_pending.connect_name));
+    s_pending.name_filter[0] = '\0';
+    s_pending.addr_filter[0] = '\0';
+    s_pending.service_uuid_filter[0] = '\0';
+    s_pending.scan_results_count = 0;
+
+    struct ble_gap_disc_params params;
+    memset(&params, 0, sizeof(params));
+    params.passive = 0;
+    params.filter_duplicates = 1;
+    params.itvl = 0x0010;
+    params.window = 0x0010;
+
+    int rc = ble_gap_disc(s_own_addr_type, timeout_ms, &params, gap_event_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        return false;
+    }
+    s_state = BLE_CENTRAL_STATE_CONNECTING;
+    return true;
+}
+
+bool ble_central_disconnect_start(int64_t request_id)
+{
+    if (s_state == BLE_CENTRAL_STATE_CONNECTING) {
+        ble_gap_conn_cancel();
+        clear_pending();
+        s_state = BLE_CENTRAL_STATE_IDLE;
+        command_dispatcher_on_disconnected("connect_cancelled");
+        return true;
+    }
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
+    s_state = BLE_CENTRAL_STATE_DISCONNECTING;
+    ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    (void)request_id; /* completion arrives via BLE_GAP_EVENT_DISCONNECT */
+    return true;
+}
+
+bool ble_central_disc_services_start(int64_t request_id, uint32_t timeout_ms)
+{
+    if (s_pending.active) return false;
+    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) return false;
+
+    s_service_count = 0;
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_DISC_SERVICES, request_id, timeout_ms);
+    s_state = BLE_CENTRAL_STATE_DISCOVERING;
+    int rc = ble_gattc_disc_all_svcs(s_conn_handle, disc_svc_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        s_state = BLE_CENTRAL_STATE_CONNECTED;
+        return false;
+    }
+    return true;
+}
+
+bool ble_central_disc_characteristics_start(int64_t request_id, uint32_t timeout_ms,
+                                             const char *service_uuid)
+{
+    if (s_pending.active) return false;
+    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) return false;
+
+    uint16_t start = 0x0001, end = 0xFFFF;
+    if (service_uuid != NULL && service_uuid[0] != '\0') {
+        bool found = false;
+        for (int i = 0; i < s_service_count; i++) {
+            if (strcasecmp(s_services[i].uuid, service_uuid) == 0) {
+                start = s_services[i].start_handle;
+                end = s_services[i].end_handle;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+
+    s_chr_count = 0;
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_DISC_CHARACTERISTICS, request_id, timeout_ms);
+    s_state = BLE_CENTRAL_STATE_DISCOVERING;
+    int rc = ble_gattc_disc_all_chrs(s_conn_handle, start, end, disc_chr_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        s_state = BLE_CENTRAL_STATE_READY;
+        return false;
+    }
+    return true;
+}
+
+bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid)
+{
+    if (s_pending.active) return false;
+    if (s_state != BLE_CENTRAL_STATE_READY) return false;
+    uint16_t handle = ble_central_find_char_val_handle(char_uuid);
+    if (handle == 0xFFFF) return false;
+
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_READ, request_id, timeout_ms);
+    int rc = ble_gattc_read(s_conn_handle, handle, read_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        return false;
+    }
+    return true;
+}
+
+bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
+                              const uint8_t *data, size_t len, bool with_response)
+{
+    if (s_pending.active) return false;
+    if (s_state != BLE_CENTRAL_STATE_READY) return false;
+    if (len > BLE_CENTRAL_MAX_READ_LEN) return false;
+    uint16_t handle = ble_central_find_char_val_handle(char_uuid);
+    if (handle == 0xFFFF) return false;
+
+    uint32_t gen = begin_pending(BLE_CENTRAL_OP_WRITE, request_id, timeout_ms);
+    memcpy(s_pending.write_buf, data, len);
+    s_pending.write_len = len;
+
+    int rc;
+    if (with_response) {
+        rc = ble_gattc_write_flat(s_conn_handle, handle, s_pending.write_buf, len,
+                                    write_cb, (void *)(uintptr_t)gen);
+    } else {
+        rc = ble_gattc_write_no_rsp_flat(s_conn_handle, handle, s_pending.write_buf, len);
+        if (rc == 0) {
+            clear_pending();
+            command_dispatcher_on_write_done(request_id);
+            return true;
+        }
+    }
+    if (rc != 0) {
+        clear_pending();
+        return false;
+    }
+    return true;
+}
+
+static bool subscribe_common(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
+                              const uint8_t *cccd_value, ble_central_op_t op)
+{
+    if (s_pending.active) return false;
+    if (s_state != BLE_CENTRAL_STATE_READY) return false;
+    uint16_t val_handle = ble_central_find_char_val_handle(char_uuid);
+    if (val_handle == 0xFFFF) return false;
+    /* CCCD is the descriptor immediately following the value attribute
+     * -- true for every NimBLE-GATT-server characteristic that declares
+     * NOTIFY/INDICATE with no other descriptor ahead of it, which is how
+     * HolterLEV's own NimBLE-based GATT table is built (PROTOCOL.md
+     * Section 1/8). Known simplification: a peer with additional
+     * descriptors declared before the CCCD would need real descriptor
+     * discovery instead -- see docs/PROTOCOL_REFERENCE.md limitations. */
+    uint16_t cccd_handle = val_handle + 1;
+
+    uint32_t gen = begin_pending(op, request_id, timeout_ms);
+    memcpy(s_pending.write_buf, cccd_value, 2);
+    s_pending.write_len = 2;
+    int rc = ble_gattc_write_flat(s_conn_handle, cccd_handle, s_pending.write_buf, 2,
+                                    write_cb, (void *)(uintptr_t)gen);
+    if (rc != 0) {
+        clear_pending();
+        return false;
+    }
+    return true;
+}
+
+bool ble_central_subscribe_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
+                                  bool indicate)
+{
+    uint8_t val[2] = { indicate ? (uint8_t)0x02 : (uint8_t)0x01, 0x00 };
+    return subscribe_common(request_id, timeout_ms, char_uuid, val, BLE_CENTRAL_OP_SUBSCRIBE);
+}
+
+bool ble_central_unsubscribe_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid)
+{
+    uint8_t val[2] = { 0x00, 0x00 };
+    return subscribe_common(request_id, timeout_ms, char_uuid, val, BLE_CENTRAL_OP_UNSUBSCRIBE);
+}
+
+void ble_central_clear_bonds(void)
+{
+    ble_store_clear();
+}
+
+void ble_central_reset(void)
+{
+    clear_pending();
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    if (s_state == BLE_CENTRAL_STATE_SCANNING) {
+        ble_gap_disc_cancel();
+    }
+    s_service_count = 0;
+    s_chr_count = 0;
+    s_state = BLE_CENTRAL_STATE_IDLE;
+}
