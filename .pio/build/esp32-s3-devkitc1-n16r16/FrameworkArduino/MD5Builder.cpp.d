@@ -1,0 +1,20 @@
+.pio/build/esp32-s3-devkitc1-n16r16/FrameworkArduino/MD5Builder.cpp.o: \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.cpp \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/HEXBuilder.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/pgmspace.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/newlib/platform_include/ctype.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/Stream.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/Print.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/newlib/platform_include/stdio.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/WString.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/Printable.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/MD5Builder.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_system/include/esp_system.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_common/include/esp_err.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_common/include/esp_compiler.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_common/include/esp_attr.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_common/include/esp_bit_defs.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_common/include/esp_idf_version.h \
+ C:/PIO/packages/framework-arduinoespressif32-libs/esp32s3/include/esp_rom/include/esp_rom_md5.h \
+ C:/PIO/packages/framework-arduinoespressif32/cores/esp32/HashBuilder.h
