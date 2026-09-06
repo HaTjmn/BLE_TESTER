@@ -26,3 +26,16 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # flashing: 16MB flash on this test-controller board.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# BLE-D4.0D Step 4 -- diagnosing a captured StoreProhibited panic inside
+# FreeRTOS's own Timer Service Task (uxListRemove). The default
+# CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY only checks at a context
+# switch, by which point the corrupting write may be long gone; the
+# watchpoint method traps the instant any of a task's last 32 stack bytes
+# are written, giving a precise, immediate signal instead of an inference.
+# GCC's own stack-protector catches local-buffer overruns the watchpoint
+# wouldn't (an overrun contained within one stack frame, not reaching the
+# very end of the whole task stack). Verified against this project's own
+# installed Kconfig (kconfig_menus.json) before adding, not guessed.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y

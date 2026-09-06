@@ -209,7 +209,12 @@ typedef struct {
     uint32_t largest_free_internal_block;
     uint32_t notifications_received;       /* all characteristics, since this boot */
     uint32_t notification_bytes_received;
-    uint32_t nimble_host_task_stack_highwater_words;  /* uxTaskGetStackHighWaterMark units */
+    /* BLE-D4.0D Step 3: confirmed, not assumed -- this port's StackType_t is
+     * `uint8_t` (portmacro.h: `#define portSTACK_TYPE uint8_t`), so
+     * uxTaskGetStackHighWaterMark() returns a count in BYTES on this build,
+     * not 32-bit words. Do not apply a x4 conversion when reading these. */
+    uint32_t nimble_host_task_stack_highwater_bytes;
+    uint32_t timer_task_stack_highwater_bytes;   /* FreeRTOS Timer Service Task */
     bool     pending_operation_active;
     uint32_t state_transition_total;
 } ble_central_health_t;

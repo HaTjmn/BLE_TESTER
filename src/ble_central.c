@@ -1097,8 +1097,16 @@ void ble_central_get_health(ble_central_health_t *out)
     out->largest_free_internal_block = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     out->notifications_received = s_notify_count;
     out->notification_bytes_received = s_notify_bytes;
-    out->nimble_host_task_stack_highwater_words = s_host_task_handle != NULL
+    out->nimble_host_task_stack_highwater_bytes = s_host_task_handle != NULL
         ? (uint32_t)uxTaskGetStackHighWaterMark(s_host_task_handle)
+        : 0;
+    /* BLE-D4.0D Step 3: the actual task implicated in the captured panic
+     * backtrace (prvTimerTask) -- xTimerGetTimerDaemonTaskHandle() is the
+     * documented, ESP-IDF-available way to get its handle without needing
+     * to guess or wrap the daemon task ourselves. */
+    TaskHandle_t timer_task = xTimerGetTimerDaemonTaskHandle();
+    out->timer_task_stack_highwater_bytes = timer_task != NULL
+        ? (uint32_t)uxTaskGetStackHighWaterMark(timer_task)
         : 0;
     out->pending_operation_active = s_pending.active;
     out->state_transition_total = s_trace_total;

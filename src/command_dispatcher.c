@@ -14,7 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.2.2-diag"
+#define FIRMWARE_VERSION      "0.2.3-diag"
 #define UART_PROTOCOL_VERSION "1.0"
 
 #define MIRROR_DATA_MAX   128
@@ -433,7 +433,8 @@ static void cmd_diag_health(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "largest_free_internal_block", h.largest_free_internal_block);
     cJSON_AddNumberToObject(j, "notifications_received", h.notifications_received);
     cJSON_AddNumberToObject(j, "notification_bytes_received", h.notification_bytes_received);
-    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_words", h.nimble_host_task_stack_highwater_words);
+    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_bytes", h.nimble_host_task_stack_highwater_bytes);
+    cJSON_AddNumberToObject(j, "timer_task_stack_highwater_bytes", h.timer_task_stack_highwater_bytes);
     cJSON_AddBoolToObject(j, "pending_operation_active", h.pending_operation_active);
     cJSON_AddNumberToObject(j, "state_transition_total", h.state_transition_total);
     protocol_json_send_ok(id, j);
@@ -477,7 +478,8 @@ static void cmd_diag_file_hash_summary(int64_t id, cJSON *root)
     ble_central_health_t h;
     ble_central_get_health(&h);
     cJSON_AddNumberToObject(j, "minimum_free_internal_heap", h.minimum_free_internal_heap);
-    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_words", h.nimble_host_task_stack_highwater_words);
+    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_bytes", h.nimble_host_task_stack_highwater_bytes);
+    cJSON_AddNumberToObject(j, "timer_task_stack_highwater_bytes", h.timer_task_stack_highwater_bytes);
 
     protocol_json_send_ok(id, j);
 }
