@@ -52,6 +52,7 @@ typedef enum {
     BLE_CENTRAL_OP_WRITE,
     BLE_CENTRAL_OP_SUBSCRIBE,
     BLE_CENTRAL_OP_UNSUBSCRIBE,
+    BLE_CENTRAL_OP_DIAG_RACE_TEST,  /* BLE-D4.0E: synthetic op, diag_race_test only -- see ble_central_diag_race_test() */
 } ble_central_op_t;
 
 /* Dispatcher-side notifications. Called from whatever context completes
@@ -217,9 +218,43 @@ typedef struct {
     uint32_t timer_task_stack_highwater_bytes;   /* FreeRTOS Timer Service Task */
     bool     pending_operation_active;
     uint32_t state_transition_total;
+
+    /* BLE-D4.0E Step 3 -- timeout-ownership event flow. */
+    uint32_t timeout_events_queued;               /* Timer Task successfully posted */
+    uint32_t timeout_events_queue_full;            /* Timer Task's post failed -- queue was full */
+    uint32_t timeout_events_processed;             /* UART processor task drained and responded to */
+    uint32_t late_completions_ignored;             /* a real GATT/GAP completion arrived after its op was already claimed (timed out/cancelled) */
+    uint32_t duplicate_completions_prevented;      /* the timer's claim attempt lost the race to a completion that claimed first */
 } ble_central_health_t;
 
 void ble_central_get_health(ble_central_health_t *out);
+
+/* BLE-D4.0E: drains any timeout events the Timer Service Task has posted
+ * and turns each into the same TIMEOUT response command_dispatcher.c
+ * already produces -- call this from a task with an adequate stack (the
+ * UART processor task), never from the timer callback itself. */
+void ble_central_drain_timeout_events(void);
+
+/* BLE-D4.0E: diagnostic-only. Creates a synthetic pending operation with
+ * a 1-tick deadline and deliberately never completes it, so the REAL
+ * timer/claim/queue/drain pipeline processes it exactly like a real
+ * timed-out operation. Must never be reachable from a production build
+ * (see command_dispatcher.c's own guard on this command). Returns false
+ * without doing anything if a real operation is already pending, rather
+ * than clobbering it. */
+bool ble_central_diag_force_timeout(int64_t request_id);
+
+/* BLE-D4.0E Test 2: schedules a synthetic completion (or, if
+ * disconnect_mode, a synthetic disconnect cancellation) to race against
+ * the real timeout at RACE_TEST_DEADLINE_MS + offset_ms. Negative
+ * offset_ms lands before the real deadline, positive after. Returns
+ * false without doing anything if a real operation is already pending. */
+bool ble_central_diag_race_test(int64_t request_id, int32_t offset_ms, bool disconnect_mode);
+
+/* Cumulative counters since boot: how many race tests the synthetic
+ * completion won, how many the real timeout won, and (a correctness
+ * canary that should always read zero) how many neither claimed. */
+void ble_central_diag_race_test_counters(uint32_t *completion_won, uint32_t *timeout_won, uint32_t *neither_won);
 
 #ifdef __cplusplus
 }

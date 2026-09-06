@@ -24,7 +24,15 @@ extern "C" {
 
 typedef void (*uart_command_line_handler_t)(char *line);
 
-void uart_command_server_init(uart_command_line_handler_t handler);
+/* BLE-D4.0E: called from the processor task on every bounded wait cycle,
+ * whether or not a line arrived -- this is how a queued event that isn't
+ * a UART line (the Timer Service Task's own timeout events) gets drained
+ * on a task with a large enough stack for JSON/UART work, without this
+ * module needing to know anything about BLE or the timeout mechanism.
+ * May be NULL if the caller has nothing to poll. */
+typedef void (*uart_command_poll_fn_t)(void);
+
+void uart_command_server_init(uart_command_line_handler_t handler, uart_command_poll_fn_t poll_fn);
 
 /* Thread-safe: appends '\n' and writes atomically so a response and an
  * unsolicited event (e.g. a BLE notification, emitted from the NimBLE

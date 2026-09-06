@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_system.h"
 #include "esp_attr.h"
@@ -65,6 +66,138 @@ typedef struct {
 
 static pending_op_t s_pending = {0};
 static TimerHandle_t s_timeout_timer;
+
+/* BLE-D4.0E: the ONE lock protecting every read-modify-write of s_pending,
+ * s_state, s_conn_handle, and the trace ring buffer -- these are touched
+ * from three different tasks (UART processor_task via begin_pending(),
+ * the NimBLE host task via GAP/GATT callbacks, and the FreeRTOS Timer
+ * Service Task via timeout_timer_cb()) with no prior synchronization
+ * (BLE-D4.0D Step 2 audit). A spinlock (portMUX), not a mutex/semaphore:
+ * every section under it is a few field reads/writes, never a blocking
+ * call, so there is nothing to invert priority against and no reason to
+ * pay for a semaphore. Never hold this across JSON/UART/NimBLE-API/
+ * allocation work -- see the timer callback and *_claim* helpers below. */
+static portMUX_TYPE s_central_state_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* BLE-D4.0E: who is allowed to terminate a pending operation, and why. */
+typedef enum {
+    CLAIM_REASON_COMPLETED = 0,
+    CLAIM_REASON_TIMEOUT,
+    CLAIM_REASON_DISCONNECT_CANCELLED,
+    CLAIM_REASON_ABORT,
+} claim_reason_t;
+
+/* Stable snapshot handed to whichever context wins the atomic claim --
+ * everything the claimer needs to finish the job OUTSIDE the lock. */
+typedef struct {
+    ble_central_op_t op;
+    int64_t          request_id;
+    uint32_t         generation;
+    claim_reason_t   reason;
+} pending_claim_t;
+
+/* BLE-D4.0E Step 2/3: the Timer Service Task must never build JSON or
+ * touch UART. It posts a small, fixed-size event here instead; the UART
+ * processor task (uart_command_server.c, 8192-byte stack) drains it and
+ * does the actual protocol_json_send_error() work. Depth 8 is generous --
+ * only one operation is ever pending at a time by this codebase's own
+ * design, so at most one timeout event is ever truly in flight; the
+ * margin is for a burst of forced-timeout diagnostic testing. */
+#define TIMEOUT_EVENT_QUEUE_DEPTH 8
+static QueueHandle_t s_timeout_event_queue;
+
+/* BLE-D4.0E Step 3 counters -- exposed via diag_health for hardware
+ * validation, never logged from the timer callback itself. */
+static uint32_t s_timeout_events_queued = 0;
+static uint32_t s_timeout_events_queue_full = 0;
+static uint32_t s_timeout_events_processed = 0;
+static uint32_t s_late_completions_ignored = 0;       /* a normal GATT/GAP completion arrived after the op had already been claimed (timed out/cancelled) */
+static uint32_t s_duplicate_completions_prevented = 0; /* the timer tried to claim an op a normal completion had already claimed first */
+
+/* BLE-D4.0E Test 2 race-test counters -- declared here (not next to the
+ * rest of the race-test machinery further below) so timeout_timer_cb()
+ * can reference them without a forward declaration. */
+static uint32_t s_race_completion_won = 0;
+static uint32_t s_race_timeout_won = 0;
+static uint32_t s_race_neither_won = 0; /* should never happen -- tracked as a correctness canary */
+
+/* Atomically claims the currently-active pending operation for
+ * termination -- succeeds for at most one caller per generation. Does
+ * NOT check the deadline; use try_claim_pending_timeout() for that.
+ * Safe to call from any task; never blocks. */
+static bool try_claim_pending_completion(uint32_t generation, claim_reason_t reason, pending_claim_t *out)
+{
+    bool ok = false;
+    portENTER_CRITICAL(&s_central_state_lock);
+    if (s_pending.active && s_pending.generation == generation) {
+        out->op = s_pending.op;
+        out->request_id = s_pending.request_id;
+        out->generation = s_pending.generation;
+        out->reason = reason;
+        s_pending.active = false;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return ok;
+}
+
+/* Timer-only: atomically checks the deadline AND claims in the SAME
+ * critical section -- no separate check-then-claim window for a GATT
+ * completion to slip through. Deadline comparison is wrap-safe: a signed
+ * subtraction of two TickType_t values is correct across a rollover as
+ * long as the true elapsed time is under half the TickType_t range,
+ * which holds for any timeout this codebase ever configures (seconds,
+ * against a 32-bit tick count). */
+static bool try_claim_pending_timeout(pending_claim_t *out)
+{
+    bool ok = false;
+    portENTER_CRITICAL(&s_central_state_lock);
+    if (s_pending.active) {
+        TickType_t now = xTaskGetTickCount();
+        int32_t remaining = (int32_t)(s_pending.deadline_tick - now);
+        if (remaining <= 0) {
+            out->op = s_pending.op;
+            out->request_id = s_pending.request_id;
+            out->generation = s_pending.generation;
+            out->reason = CLAIM_REASON_TIMEOUT;
+            s_pending.active = false;
+            ok = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return ok;
+}
+
+/* Disconnect-cancellation only: claims whatever is currently active
+ * regardless of generation (a disconnect cancels ANY in-flight op, not
+ * one specific one the caller already knows the generation of). */
+static bool try_claim_pending_any(claim_reason_t reason, pending_claim_t *out)
+{
+    bool ok = false;
+    portENTER_CRITICAL(&s_central_state_lock);
+    if (s_pending.active) {
+        out->op = s_pending.op;
+        out->request_id = s_pending.request_id;
+        out->generation = s_pending.generation;
+        out->reason = reason;
+        s_pending.active = false;
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return ok;
+}
+
+/* Atomic combined read of active+generation+op -- used by callbacks that
+ * only need to decide whether to keep accumulating (e.g. one more scan
+ * result or discovered service), not to claim/terminate anything yet. */
+static bool op_is_current_with_op(uint32_t generation, ble_central_op_t op)
+{
+    bool match;
+    portENTER_CRITICAL(&s_central_state_lock);
+    match = s_pending.active && s_pending.generation == generation && s_pending.op == op;
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return match;
+}
 
 /* BLE-D4.0B diagnostics: last-rejection snapshot, real disconnect reason,
  * and a bounded state-transition trace. All purely additive/read-only from
@@ -322,46 +455,91 @@ static bool str_to_addr(const char *str, ble_addr_t *out)
 
 static uint32_t begin_pending(ble_central_op_t op, int64_t request_id, uint32_t timeout_ms)
 {
+    uint32_t gen;
+    portENTER_CRITICAL(&s_central_state_lock);
     s_pending.active = true;
     s_pending.generation++;
     s_pending.op = op;
     s_pending.request_id = request_id;
+    /* A fresh deadline for a fresh generation -- a new request can never
+     * inherit a previous one's deadline_tick because this is the only
+     * place deadline_tick is ever written, always alongside a generation
+     * bump, under the same critical section. */
     s_pending.deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    return s_pending.generation;
+    gen = s_pending.generation;
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return gen;
 }
 
 static void clear_pending(void)
 {
+    portENTER_CRITICAL(&s_central_state_lock);
     s_pending.active = false;
+    portEXIT_CRITICAL(&s_central_state_lock);
 }
 
 static bool op_is_current(uint32_t generation)
 {
-    return s_pending.active && s_pending.generation == generation;
+    bool current;
+    portENTER_CRITICAL(&s_central_state_lock);
+    current = s_pending.active && s_pending.generation == generation;
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return current;
 }
 
+/* BLE-D4.0E: fixed-size, POD -- safe to copy through a FreeRTOS queue.
+ * Carries `reason` so the SAME lightweight post-to-queue path serves
+ * both the real timer and the diagnostic race-test timer: EVERY FreeRTOS
+ * software timer callback runs on the one shared Timer Service Task, so
+ * a second timer calling command_dispatcher_* directly would reintroduce
+ * exactly the bug this queue exists to eliminate -- confirmed the hard
+ * way (see the BLE-D4.0E report's race-test panic, root-caused to this
+ * exact mistake in the first version of race_completion_timer_cb()). */
+typedef struct {
+    ble_central_op_t op;
+    int64_t          request_id;
+    uint32_t         generation;
+    claim_reason_t   reason;
+} timeout_event_t;
+
+/* Runs on the FreeRTOS Timer Service Task. Deliberately minimal: one
+ * atomic claim-or-nothing check, at most two cheap NimBLE cancel calls
+ * (already non-blocking posts to the NimBLE host task, same as before
+ * this change), one state-trace update (also lock-protected, no
+ * allocation), and one non-blocking queue post. No cJSON, no UART, no
+ * mutex wait, no allocation -- that work now happens in
+ * drain_timeout_events() on the UART processor task instead. */
 static void timeout_timer_cb(TimerHandle_t t)
 {
     (void)t;
-    if (!s_pending.active) return;
-    if (xTaskGetTickCount() < s_pending.deadline_tick) return;
+    pending_claim_t claim;
+    if (!try_claim_pending_timeout(&claim)) return;
 
-    int64_t id = s_pending.request_id;
-    ble_central_op_t op = s_pending.op;
-    clear_pending();
-
-    if (op == BLE_CENTRAL_OP_SCAN) {
+    if (claim.op == BLE_CENTRAL_OP_SCAN) {
         ble_gap_disc_cancel();
         set_state(BLE_CENTRAL_STATE_IDLE, "scan_timeout", 0);
-    } else if (op == BLE_CENTRAL_OP_CONNECT) {
+    } else if (claim.op == BLE_CENTRAL_OP_CONNECT) {
         ble_gap_conn_cancel();
         set_state(BLE_CENTRAL_STATE_IDLE, "connect_timeout", 0);
+    } else if (claim.op == BLE_CENTRAL_OP_DIAG_RACE_TEST) {
+        s_race_timeout_won++;
     }
     /* GATT ops (discovery/read/write/subscribe): nothing to actively
-     * cancel in NimBLE; we just stop waiting. Any late callback will see
-     * a generation mismatch and drop its own result silently. */
+     * cancel in NimBLE; we just stop waiting. A completion callback that
+     * arrives after this point will fail its own claim attempt (the
+     * generation is already spent) and count itself as a late
+     * completion -- see try_claim_pending_completion()'s call sites. */
 
-    command_dispatcher_on_op_timeout(id);
+    timeout_event_t ev = { .op = claim.op, .request_id = claim.request_id,
+                            .generation = claim.generation, .reason = claim.reason };
+    if (xQueueSend(s_timeout_event_queue, &ev, 0) == pdTRUE) {
+        s_timeout_events_queued++;
+    } else {
+        /* Queue full is not expected (depth 8, at most one op pending at
+         * a time by design) but must never silently drop a terminal
+         * response nor block this task waiting for room. */
+        s_timeout_events_queue_full++;
+    }
 }
 
 /* ---------------------------------------------------------------------
@@ -385,14 +563,17 @@ static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         return 0;
     }
 
-    int64_t id = s_pending.request_id;
-    clear_pending();
+    pending_claim_t claim;
+    if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+        s_late_completions_ignored++;
+        return 0;
+    }
     if (error->status == BLE_HS_EDONE) {
         set_state(BLE_CENTRAL_STATE_READY, "svc_disc_done", 0);
-        command_dispatcher_on_svc_disc_done(id, s_services, s_service_count);
+        command_dispatcher_on_svc_disc_done(claim.request_id, s_services, s_service_count);
     } else {
         set_state(BLE_CENTRAL_STATE_CONNECTED, "svc_disc_failed", (int32_t)error->status);
-        command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "service discovery error");
+        command_dispatcher_on_op_error(claim.request_id, "DISCOVERY_FAILED", "service discovery error");
     }
     return 0;
 }
@@ -415,14 +596,17 @@ static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         return 0;
     }
 
-    int64_t id = s_pending.request_id;
-    clear_pending();
+    pending_claim_t claim;
+    if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+        s_late_completions_ignored++;
+        return 0;
+    }
     if (error->status == BLE_HS_EDONE) {
         set_state(BLE_CENTRAL_STATE_READY, "chr_disc_done", 0);
-        command_dispatcher_on_chr_disc_done(id, s_chrs, s_chr_count);
+        command_dispatcher_on_chr_disc_done(claim.request_id, s_chrs, s_chr_count);
     } else {
         set_state(BLE_CENTRAL_STATE_READY, "chr_disc_failed", (int32_t)error->status);
-        command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "characteristic discovery error");
+        command_dispatcher_on_op_error(claim.request_id, "DISCOVERY_FAILED", "characteristic discovery error");
     }
     return 0;
 }
@@ -432,20 +616,22 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 {
     (void)conn_handle;
     uint32_t gen = (uint32_t)(uintptr_t)arg;
-    if (!op_is_current(gen)) return 0;
-    int64_t id = s_pending.request_id;
-    clear_pending();
+    pending_claim_t claim;
+    if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+        s_late_completions_ignored++;
+        return 0;
+    }
     set_state(BLE_CENTRAL_STATE_READY, "read_done", (int32_t)error->status);
 
     if (error->status != 0) {
-        command_dispatcher_on_op_error(id, "READ_FAILED", "GATT read error");
+        command_dispatcher_on_op_error(claim.request_id, "READ_FAILED", "GATT read error");
         return 0;
     }
     uint16_t len = OS_MBUF_PKTLEN(attr->om);
     if (len > BLE_CENTRAL_MAX_READ_LEN) len = BLE_CENTRAL_MAX_READ_LEN;
     uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
     os_mbuf_copydata(attr->om, 0, len, buf);
-    command_dispatcher_on_read_done(id, buf, len);
+    command_dispatcher_on_read_done(claim.request_id, buf, len);
     return 0;
 }
 
@@ -455,22 +641,23 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     (void)conn_handle;
     (void)attr;
     uint32_t gen = (uint32_t)(uintptr_t)arg;
-    if (!op_is_current(gen)) return 0;
-    int64_t id = s_pending.request_id;
-    ble_central_op_t op = s_pending.op;
-    clear_pending();
+    pending_claim_t claim;
+    if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+        s_late_completions_ignored++;
+        return 0;
+    }
     set_state(BLE_CENTRAL_STATE_READY, "write_done", (int32_t)error->status);
 
     if (error->status != 0) {
-        command_dispatcher_on_op_error(id, "WRITE_FAILED", "GATT write error");
+        command_dispatcher_on_op_error(claim.request_id, "WRITE_FAILED", "GATT write error");
         return 0;
     }
-    if (op == BLE_CENTRAL_OP_SUBSCRIBE) {
-        command_dispatcher_on_subscribe_done(id, true);
-    } else if (op == BLE_CENTRAL_OP_UNSUBSCRIBE) {
-        command_dispatcher_on_subscribe_done(id, false);
+    if (claim.op == BLE_CENTRAL_OP_SUBSCRIBE) {
+        command_dispatcher_on_subscribe_done(claim.request_id, true);
+    } else if (claim.op == BLE_CENTRAL_OP_UNSUBSCRIBE) {
+        command_dispatcher_on_subscribe_done(claim.request_id, false);
     } else {
-        command_dispatcher_on_write_done(id);
+        command_dispatcher_on_write_done(claim.request_id);
     }
     return 0;
 }
@@ -550,69 +737,88 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     switch (event->type) {
     case BLE_GAP_EVENT_DISC:
-        if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_SCAN) {
-            report_scan_match(&event->disc);
-        } else if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_CONNECT) {
+        if (op_is_current_with_op(gen, BLE_CENTRAL_OP_SCAN) ||
+            op_is_current_with_op(gen, BLE_CENTRAL_OP_CONNECT)) {
             report_scan_match(&event->disc);
         }
         return 0;
 
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        if (op_is_current(gen) && s_pending.op == BLE_CENTRAL_OP_SCAN) {
-            int64_t id = s_pending.request_id;
-            int count = s_pending.scan_results_count;
-            clear_pending();
-            s_state = BLE_CENTRAL_STATE_IDLE;
-            command_dispatcher_on_scan_done(id, count);
+    case BLE_GAP_EVENT_DISC_COMPLETE: {
+        if (!op_is_current_with_op(gen, BLE_CENTRAL_OP_SCAN)) return 0;
+        pending_claim_t claim;
+        if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+            s_late_completions_ignored++;
+            return 0;
         }
+        int count = s_pending.scan_results_count; /* read-only scratch field, single-writer (this task) by construction */
+        set_state(BLE_CENTRAL_STATE_IDLE, "scan_complete", 0);
+        command_dispatcher_on_scan_done(claim.request_id, count);
         return 0;
+    }
 
-    case BLE_GAP_EVENT_CONNECT:
-        if (!op_is_current(gen) || s_pending.op != BLE_CENTRAL_OP_CONNECT) {
+    case BLE_GAP_EVENT_CONNECT: {
+        if (!op_is_current_with_op(gen, BLE_CENTRAL_OP_CONNECT)) {
             if (event->connect.status == 0) {
                 ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
             return 0;
         }
-        {
-            int64_t id = s_pending.request_id;
-            char name_copy[32];
-            strlcpy(name_copy, s_pending.connect_name, sizeof(name_copy));
-            clear_pending();
+        char name_copy[32];
+        portENTER_CRITICAL(&s_central_state_lock);
+        strlcpy(name_copy, s_pending.connect_name, sizeof(name_copy));
+        portEXIT_CRITICAL(&s_central_state_lock);
 
+        pending_claim_t claim;
+        if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+            s_late_completions_ignored++;
             if (event->connect.status == 0) {
-                s_conn_handle = event->connect.conn_handle;
-                s_connect_established_ms = now_ms();
-                set_state(BLE_CENTRAL_STATE_CONNECTED, "gap_connected", 0);
-                struct ble_gap_conn_desc desc;
-                ble_gap_conn_find(s_conn_handle, &desc);
-                addr_to_str(&desc.peer_id_addr, s_peer_addr_str, sizeof(s_peer_addr_str));
-                strlcpy(s_peer_name, name_copy, sizeof(s_peer_name));
-                ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
-                command_dispatcher_on_connected(id, s_peer_addr_str, s_peer_name);
-            } else {
-                set_state(BLE_CENTRAL_STATE_IDLE, "gap_connect_failed", (int32_t)event->connect.status);
-                command_dispatcher_on_connect_failed(id, "CONNECT_FAILED", "GAP connect failed");
+                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
+            return 0;
+        }
+
+        if (event->connect.status == 0) {
+            portENTER_CRITICAL(&s_central_state_lock);
+            s_conn_handle = event->connect.conn_handle;
+            portEXIT_CRITICAL(&s_central_state_lock);
+            s_connect_established_ms = now_ms();
+            set_state(BLE_CENTRAL_STATE_CONNECTED, "gap_connected", 0);
+            struct ble_gap_conn_desc desc;
+            ble_gap_conn_find(s_conn_handle, &desc);
+            addr_to_str(&desc.peer_id_addr, s_peer_addr_str, sizeof(s_peer_addr_str));
+            strlcpy(s_peer_name, name_copy, sizeof(s_peer_name));
+            ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
+            command_dispatcher_on_connected(claim.request_id, s_peer_addr_str, s_peer_name);
+        } else {
+            set_state(BLE_CENTRAL_STATE_IDLE, "gap_connect_failed", (int32_t)event->connect.status);
+            command_dispatcher_on_connect_failed(claim.request_id, "CONNECT_FAILED", "GAP connect failed");
         }
         return 0;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT: {
         uint16_t disconnected_handle = event->disconnect.conn.conn_handle;
-        if (disconnected_handle == s_conn_handle) {
+        portENTER_CRITICAL(&s_central_state_lock);
+        bool is_current_conn = (disconnected_handle == s_conn_handle);
+        if (is_current_conn) {
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        }
+        portEXIT_CRITICAL(&s_central_state_lock);
+
+        if (is_current_conn) {
             /* Capture the real reason and full context BEFORE clearing any
              * of it -- record_disconnect() and set_state() both read
-             * s_pending/s_state/s_conn_handle as they currently stand. */
+             * s_pending/s_state/s_conn_handle as they currently stand
+             * (s_conn_handle already cleared above, matching the ordering
+             * record_disconnect() expects for connection_duration_ms). */
             record_disconnect(disconnected_handle, event->disconnect.reason);
-            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             set_state(BLE_CENTRAL_STATE_IDLE, "gap_disconnect", event->disconnect.reason);
             s_service_count = 0;
             s_chr_count = 0;
             s_mtu = 23;
-            if (s_pending.active) {
-                int64_t id = s_pending.request_id;
-                clear_pending();
-                command_dispatcher_on_op_error(id, "DISCONNECTED", "peer disconnected mid-operation");
+            pending_claim_t claim;
+            if (try_claim_pending_any(CLAIM_REASON_DISCONNECT_CANCELLED, &claim)) {
+                command_dispatcher_on_op_error(claim.request_id, "DISCONNECTED", "peer disconnected mid-operation");
             }
             /* BLE-D4.0B Step 4: report the real captured reason, never the
              * old hardcoded "peer_disconnect" string regardless of cause. */
@@ -713,6 +919,8 @@ void ble_central_init(void)
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set("holter-test-ctrl");
+
+    s_timeout_event_queue = xQueueCreate(TIMEOUT_EVENT_QUEUE_DEPTH, sizeof(timeout_event_t));
 
     s_timeout_timer = xTimerCreate("op_timeout", pdMS_TO_TICKS(200), pdTRUE, NULL, timeout_timer_cb);
     xTimerStart(s_timeout_timer, 0);
@@ -1108,6 +1316,155 @@ void ble_central_get_health(ble_central_health_t *out)
     out->timer_task_stack_highwater_bytes = timer_task != NULL
         ? (uint32_t)uxTaskGetStackHighWaterMark(timer_task)
         : 0;
+    portENTER_CRITICAL(&s_central_state_lock);
     out->pending_operation_active = s_pending.active;
+    portEXIT_CRITICAL(&s_central_state_lock);
     out->state_transition_total = s_trace_total;
+    out->timeout_events_queued = s_timeout_events_queued;
+    out->timeout_events_queue_full = s_timeout_events_queue_full;
+    out->timeout_events_processed = s_timeout_events_processed;
+    out->late_completions_ignored = s_late_completions_ignored;
+    out->duplicate_completions_prevented = s_duplicate_completions_prevented;
+}
+
+/* BLE-D4.0E Step (drain): runs on the UART processor task (large stack),
+ * called from uart_command_server's poll hook every ~20ms. Pops every
+ * currently-queued event -- from either timer -- and turns it into the
+ * matching response on this task's own stack, never the Timer Service
+ * Task's. A real timeout produces the same TIMEOUT response
+ * command_dispatcher_on_op_timeout() always did; a race-test win (the
+ * ONLY other way an event reaches this queue) produces the
+ * RACE_TEST_COMPLETED response instead. */
+void ble_central_drain_timeout_events(void)
+{
+    timeout_event_t ev;
+    while (xQueueReceive(s_timeout_event_queue, &ev, 0) == pdTRUE) {
+        s_timeout_events_processed++;
+        if (ev.reason == CLAIM_REASON_TIMEOUT) {
+            command_dispatcher_on_op_timeout(ev.request_id);
+        } else {
+            command_dispatcher_on_op_error(ev.request_id, "RACE_TEST_COMPLETED",
+                ev.reason == CLAIM_REASON_DISCONNECT_CANCELLED
+                    ? "synthetic disconnect cancellation won the race"
+                    : "synthetic completion won the race");
+        }
+    }
+}
+
+/* BLE-D4.0E: diagnostic-only synthetic pending operation for
+ * diag_force_timeout -- exercises the REAL timer -> claim -> queue ->
+ * drain -> UART pipeline without ever touching NimBLE. Refuses to clobber
+ * a genuinely in-flight operation (this codebase's own one-pending-op
+ * invariant, checked atomically so a real begin_pending() racing with
+ * this can't interleave): returns false and does nothing in that case,
+ * rather than silently stomping the real operation's generation. */
+bool ble_central_diag_force_timeout(int64_t request_id)
+{
+    bool started = false;
+    portENTER_CRITICAL(&s_central_state_lock);
+    if (!s_pending.active) {
+        s_pending.active = true;
+        s_pending.generation++;
+        s_pending.op = BLE_CENTRAL_OP_NONE;
+        s_pending.request_id = request_id;
+        /* A 1-tick deadline (not 0) guarantees try_claim_pending_timeout()'s
+         * `remaining <= 0` check is already true the moment the timer next
+         * runs, without depending on pdMS_TO_TICKS(0) happening to floor
+         * to something timing-sensitive. */
+        s_pending.deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(1);
+        started = true;
+    }
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return started;
+}
+
+/* BLE-D4.0E: deterministic timeout/completion race test. A synthetic
+ * pending op is given a fixed deadline; a one-shot timer independently
+ * fires a synthetic "completion" (or, in disconnect mode, a disconnect
+ * cancellation) at deadline+offset_ms -- negative offsets land before the
+ * real timeout, positive ones after. Both the completion-timer callback
+ * and the real periodic timeout_timer_cb() race for the SAME atomic
+ * claim; exactly one can ever win, by construction, regardless of which
+ * fires first. This is what Test 2 measures. */
+#define RACE_TEST_DEADLINE_MS 300U
+
+typedef struct {
+    int64_t  request_id;
+    uint32_t generation;
+    bool     disconnect_mode;
+} race_test_ctx_t;
+
+static TimerHandle_t   s_race_completion_timer;
+static race_test_ctx_t s_race_ctx;
+
+/* Runs on the FreeRTOS Timer Service Task, same as timeout_timer_cb() --
+ * EVERY software timer's callback shares that one task, so this must be
+ * exactly as lightweight: claim-or-nothing, then a non-blocking queue
+ * post, nothing else. The first version of this function called
+ * command_dispatcher_on_op_error() directly and reintroduced the exact
+ * JSON/UART-on-timer-task defect the rest of this change eliminates --
+ * confirmed on hardware (a real "Stack canary watchpoint triggered (Tmr
+ * Svc)" panic, BLE-D4.0E report). Never repeat that mistake here. */
+static void race_completion_timer_cb(TimerHandle_t t)
+{
+    (void)t;
+    pending_claim_t claim;
+    bool ok = s_race_ctx.disconnect_mode
+        ? try_claim_pending_any(CLAIM_REASON_DISCONNECT_CANCELLED, &claim)
+        : try_claim_pending_completion(s_race_ctx.generation, CLAIM_REASON_COMPLETED, &claim);
+    if (!ok) {
+        /* The real timer already claimed (or is about to claim) this
+         * generation first -- this is the "duplicate prevented" side of
+         * the race from the completion's own point of view. */
+        s_duplicate_completions_prevented++;
+        return;
+    }
+    s_race_completion_won++;
+    timeout_event_t ev = { .op = claim.op, .request_id = claim.request_id,
+                            .generation = claim.generation, .reason = claim.reason };
+    if (xQueueSend(s_timeout_event_queue, &ev, 0) == pdTRUE) {
+        s_timeout_events_queued++;
+    } else {
+        s_timeout_events_queue_full++;
+    }
+}
+
+bool ble_central_diag_race_test(int64_t request_id, int32_t offset_ms, bool disconnect_mode)
+{
+    uint32_t gen;
+    bool started = false;
+    portENTER_CRITICAL(&s_central_state_lock);
+    if (!s_pending.active) {
+        s_pending.active = true;
+        s_pending.generation++;
+        s_pending.op = BLE_CENTRAL_OP_DIAG_RACE_TEST;
+        s_pending.request_id = request_id;
+        s_pending.deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(RACE_TEST_DEADLINE_MS);
+        gen = s_pending.generation;
+        started = true;
+    }
+    portEXIT_CRITICAL(&s_central_state_lock);
+    if (!started) return false;
+
+    s_race_ctx.request_id = request_id;
+    s_race_ctx.generation = gen;
+    s_race_ctx.disconnect_mode = disconnect_mode;
+
+    int32_t fire_ms = (int32_t)RACE_TEST_DEADLINE_MS + offset_ms;
+    if (fire_ms < 1) fire_ms = 1;
+    if (s_race_completion_timer == NULL) {
+        s_race_completion_timer = xTimerCreate("race_test", pdMS_TO_TICKS((uint32_t)fire_ms),
+                                                pdFALSE, NULL, race_completion_timer_cb);
+    } else {
+        xTimerChangePeriod(s_race_completion_timer, pdMS_TO_TICKS((uint32_t)fire_ms), 0);
+    }
+    xTimerStart(s_race_completion_timer, 0);
+    return true;
+}
+
+void ble_central_diag_race_test_counters(uint32_t *completion_won, uint32_t *timeout_won, uint32_t *neither_won)
+{
+    *completion_won = s_race_completion_won;
+    *timeout_won = s_race_timeout_won;
+    *neither_won = s_race_neither_won;
 }

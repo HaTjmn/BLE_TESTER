@@ -19,6 +19,14 @@
 static SemaphoreHandle_t s_tx_mutex;
 static QueueHandle_t     s_line_queue;
 static uart_command_line_handler_t s_handler;
+static uart_command_poll_fn_t s_poll_fn;
+
+/* BLE-D4.0E: how long processor_task can go without checking s_poll_fn
+ * when no UART line has arrived. Bounds the extra latency between the
+ * Timer Service Task detecting a timeout and this task turning it into
+ * an actual UART response -- small next to the 200ms op-timeout period
+ * itself, and nothing here blocks either task in the meantime. */
+#define POLL_INTERVAL_MS 20
 
 void uart_command_server_send_line(const char *line)
 {
@@ -80,15 +88,19 @@ static void processor_task(void *arg)
     (void)arg;
     char *line;
     while (true) {
-        if (xQueueReceive(s_line_queue, &line, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(s_line_queue, &line, pdMS_TO_TICKS(POLL_INTERVAL_MS)) == pdTRUE) {
             s_handler(line); /* handler owns and frees `line` */
+        }
+        if (s_poll_fn != NULL) {
+            s_poll_fn();
         }
     }
 }
 
-void uart_command_server_init(uart_command_line_handler_t handler)
+void uart_command_server_init(uart_command_line_handler_t handler, uart_command_poll_fn_t poll_fn)
 {
     s_handler = handler;
+    s_poll_fn = poll_fn;
 
     uart_config_t cfg = {
         .baud_rate = UART_BAUD_RATE,

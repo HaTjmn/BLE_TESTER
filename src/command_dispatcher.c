@@ -14,7 +14,12 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.2.3-diag"
+#define FIRMWARE_VERSION      "0.3.1-diag"
+
+/* BLE-D4.0E: diag_force_timeout deliberately manufactures a fake pending
+ * operation -- flip this to 0 for any build that isn't this diagnostic
+ * investigation's own test instrument. */
+#define BLE_TESTER_DIAG_COMMANDS_ENABLED 1
 #define UART_PROTOCOL_VERSION "1.0"
 
 #define MIRROR_DATA_MAX   128
@@ -101,6 +106,7 @@ static const char *central_op_name(ble_central_op_t op)
         case BLE_CENTRAL_OP_WRITE:                 return "WRITE";
         case BLE_CENTRAL_OP_SUBSCRIBE:              return "SUBSCRIBE";
         case BLE_CENTRAL_OP_UNSUBSCRIBE:            return "UNSUBSCRIBE";
+        case BLE_CENTRAL_OP_DIAG_RACE_TEST:          return "DIAG_RACE_TEST";
         default:                                    return "UNKNOWN";
     }
 }
@@ -437,6 +443,11 @@ static void cmd_diag_health(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "timer_task_stack_highwater_bytes", h.timer_task_stack_highwater_bytes);
     cJSON_AddBoolToObject(j, "pending_operation_active", h.pending_operation_active);
     cJSON_AddNumberToObject(j, "state_transition_total", h.state_transition_total);
+    cJSON_AddNumberToObject(j, "timeout_events_queued", h.timeout_events_queued);
+    cJSON_AddNumberToObject(j, "timeout_events_queue_full", h.timeout_events_queue_full);
+    cJSON_AddNumberToObject(j, "timeout_events_processed", h.timeout_events_processed);
+    cJSON_AddNumberToObject(j, "late_completions_ignored", h.late_completions_ignored);
+    cJSON_AddNumberToObject(j, "duplicate_completions_prevented", h.duplicate_completions_prevented);
     protocol_json_send_ok(id, j);
 }
 
@@ -483,6 +494,62 @@ static void cmd_diag_file_hash_summary(int64_t id, cJSON *root)
 
     protocol_json_send_ok(id, j);
 }
+
+/* BLE-D4.0E: diagnostic-only, gated by BLE_TESTER_DIAG_COMMANDS_ENABLED
+ * below -- flip that to 0 for anything resembling a production build.
+ * Creates a synthetic pending operation via the real begin_pending()
+ * mechanism and deliberately completes it from neither NimBLE nor this
+ * command handler -- the REAL Timer Service Task -> claim -> queue ->
+ * UART processor task pipeline is what must produce the TIMEOUT
+ * response, exercising the actual production path end to end without
+ * ever touching NimBLE or degrading a real BLE link. */
+#if BLE_TESTER_DIAG_COMMANDS_ENABLED
+static void cmd_diag_force_timeout(int64_t id, cJSON *root)
+{
+    (void)root;
+    if (!ble_central_diag_force_timeout(id)) {
+        protocol_json_send_error(id, "GATT_OPERATION_PENDING",
+                                  "a real operation is already pending -- refusing to clobber it");
+        return;
+    }
+    /* No success response sent here -- the real pipeline (timeout_timer_cb()
+     * -> ble_central_drain_timeout_events() -> command_dispatcher_on_op_timeout())
+     * sends exactly one TIMEOUT response for this id, on its own schedule
+     * (within one 200ms timer period). */
+}
+
+/* BLE-D4.0E Test 2: schedules a synthetic completion/disconnect to race
+ * the real timeout at a controlled offset. "offset_ms" (signed) may be
+ * negative (before the deadline), zero, or positive (after). */
+static void cmd_diag_race_test(int64_t id, cJSON *root)
+{
+    cJSON *offset_field = cJSON_GetObjectItemCaseSensitive(root, "offset_ms");
+    int32_t offset_ms = cJSON_IsNumber(offset_field) ? (int32_t)offset_field->valuedouble : 0;
+    bool disconnect_mode = get_bool(root, "disconnect", false);
+
+    if (!ble_central_diag_race_test(id, offset_ms, disconnect_mode)) {
+        protocol_json_send_error(id, "GATT_OPERATION_PENDING",
+                                  "a real operation is already pending -- refusing to clobber it");
+        return;
+    }
+    /* No success response sent here either -- exactly one of the real
+     * timeout or the synthetic completion/disconnect will produce a
+     * terminal response for this id; that is the entire point of the
+     * test. See diag_race_test_summary for the cumulative counters. */
+}
+
+static void cmd_diag_race_test_summary(int64_t id, cJSON *root)
+{
+    (void)root;
+    uint32_t completion_won, timeout_won, neither_won;
+    ble_central_diag_race_test_counters(&completion_won, &timeout_won, &neither_won);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "completion_won", completion_won);
+    cJSON_AddNumberToObject(j, "timeout_won", timeout_won);
+    cJSON_AddNumberToObject(j, "neither_won", neither_won);
+    protocol_json_send_ok(id, j);
+}
+#endif /* BLE_TESTER_DIAG_COMMANDS_ENABLED */
 
 static void cmd_scan(int64_t id, cJSON *root)
 {
@@ -790,7 +857,7 @@ void command_dispatcher_init(void)
     s_event_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(mirrored_event_t));
     ble_central_init();
     holterlev_client_init();
-    uart_command_server_init(command_dispatcher_handle_line);
+    uart_command_server_init(command_dispatcher_handle_line, ble_central_drain_timeout_events);
 }
 
 void command_dispatcher_handle_line(char *line)
@@ -842,6 +909,11 @@ void command_dispatcher_handle_line(char *line)
     else if (strcmp(cmd, "diag_health") == 0) cmd_diag_health(id, root);
     else if (strcmp(cmd, "diag_file_hash_mode") == 0) cmd_diag_file_hash_mode(id, root);
     else if (strcmp(cmd, "diag_file_hash_summary") == 0) cmd_diag_file_hash_summary(id, root);
+#if BLE_TESTER_DIAG_COMMANDS_ENABLED
+    else if (strcmp(cmd, "diag_force_timeout") == 0) cmd_diag_force_timeout(id, root);
+    else if (strcmp(cmd, "diag_race_test") == 0) cmd_diag_race_test(id, root);
+    else if (strcmp(cmd, "diag_race_test_summary") == 0) cmd_diag_race_test_summary(id, root);
+#endif
     else if (strcmp(cmd, "holter_connect") == 0) cmd_holter_connect(id, root);
     else if (strcmp(cmd, "holter_authenticate") == 0) cmd_holter_authenticate(id, root);
     else if (strcmp(cmd, "holter_get_status") == 0) cmd_holter_get_status(id, root);
