@@ -6,6 +6,7 @@ idf_component_register(
         "ble_central.c"
         "command_dispatcher.c"
         "holterlev_client.c"
+        "file_transfer_hash.c"
 
     INCLUDE_DIRS
         "."
@@ -14,4 +15,5 @@ idf_component_register(
         bt
         json
         nvs_flash
+        mbedtls
 )

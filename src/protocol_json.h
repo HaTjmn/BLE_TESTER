@@ -29,6 +29,11 @@ void protocol_json_send_ok(int64_t id, cJSON *extra);
  * "detail":detail}. `detail` may be NULL. */
 void protocol_json_send_error(int64_t id, const char *error_code, const char *detail);
 
+/* Same as protocol_json_send_error(), plus extra's own fields merged in
+ * (BLE-D4.0B Step 3 structured diagnostics). Takes ownership of `extra`
+ * (may be NULL) -- deletes it. */
+void protocol_json_send_error_ex(int64_t id, const char *error_code, const char *detail, cJSON *extra);
+
 /* Sends {"type":"response","id":null,"status":"error","error":
  * "PARSE_ERROR","detail":detail} -- used only when the request's own id
  * could not be determined at all (unparseable line, or id field missing

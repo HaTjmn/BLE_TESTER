@@ -16,6 +16,14 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include "freertos/task.h"
+
+#include "esp_system.h"
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
+
+#include "holterlev_protocol_ref.h"
+#include "file_transfer_hash.h"
 
 /* ---------------------------------------------------------------------
  * State
@@ -57,6 +65,177 @@ typedef struct {
 
 static pending_op_t s_pending = {0};
 static TimerHandle_t s_timeout_timer;
+
+/* BLE-D4.0B diagnostics: last-rejection snapshot, real disconnect reason,
+ * and a bounded state-transition trace. All purely additive/read-only from
+ * the outside -- see ble_central.h for field meanings. */
+static ble_central_reject_info_t     s_last_reject = {0};
+static ble_central_disconnect_info_t s_last_disconnect = {0};
+static bool     s_local_disconnect_requested = false;
+static int64_t  s_connect_established_ms = 0;
+
+static ble_central_trace_entry_t s_trace[BLE_CENTRAL_TRACE_DEPTH];
+static uint32_t s_trace_total = 0; /* monotonically increasing count ever recorded */
+
+/* BLE-D4.0C Step 1: boot generation survives a software reset, task/int
+ * watchdog reset, or panic reboot (RTC fast memory is untouched by those --
+ * only a true power-on/brownout reset clears it, detected via the magic
+ * value going missing). This is what lets a client tell "the chip
+ * rebooted" apart from "the BLE link merely dropped" -- s_conn_handle and
+ * s_state alone cannot make that distinction. */
+#define BOOT_GENERATION_MAGIC 0x424C4531U /* "BLE1" */
+RTC_NOINIT_ATTR static uint32_t s_boot_generation_magic;
+RTC_NOINIT_ATTR static uint32_t s_boot_generation_raw;
+
+static uint32_t s_boot_generation;
+static int64_t  s_boot_uptime_base_ms;
+static esp_reset_reason_t s_reset_reason;
+static uint32_t s_min_free_internal_heap_ever;
+static uint32_t s_notify_count = 0;
+static uint32_t s_notify_bytes = 0;
+static TaskHandle_t s_host_task_handle = NULL;
+
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    /* Standard esp_reset_reason_t values (esp_system.h) -- verified
+     * against this framework's own header, not guessed. Anything this
+     * switch doesn't recognize still reaches the caller's numeric
+     * reset_reason_code field untouched. */
+    switch (r) {
+        case ESP_RST_UNKNOWN:   return "UNKNOWN";
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXTERNAL_PIN";
+        case ESP_RST_SW:        return "SOFTWARE";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INTERRUPT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return NULL;
+    }
+}
+
+static int64_t now_ms(void);
+
+/* Called once, as early as possible in ble_central_init(). */
+static void record_boot(void)
+{
+    s_reset_reason = esp_reset_reason();
+    if (s_boot_generation_magic != BOOT_GENERATION_MAGIC) {
+        /* First boot since a true power-on/brownout (or first flash ever) --
+         * RTC fast memory contents are undefined until this magic is set. */
+        s_boot_generation_raw = 0;
+        s_boot_generation_magic = BOOT_GENERATION_MAGIC;
+    }
+    s_boot_generation_raw++;
+    s_boot_generation = s_boot_generation_raw;
+    s_boot_uptime_base_ms = now_ms();
+    s_min_free_internal_heap_ever = (uint32_t)esp_get_free_heap_size();
+}
+
+static int64_t now_ms(void)
+{
+    return (int64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+/* The ONLY place s_state is ever assigned. Records a bounded trace entry
+ * (Step 5) alongside every transition, using current s_pending/s_conn_handle
+ * as the trace's own snapshot of "what was going on at the time". */
+static void set_state(ble_central_state_t new_state, const char *event, int32_t result_code)
+{
+    ble_central_trace_entry_t *e = &s_trace[s_trace_total % BLE_CENTRAL_TRACE_DEPTH];
+    e->timestamp_ms = now_ms();
+    e->prev_state = (uint8_t)s_state;
+    e->new_state = (uint8_t)new_state;
+    strlcpy(e->event, event, sizeof(e->event));
+    e->conn_handle = s_conn_handle;
+    /* BLE-D4.0C Step 5: gate on `active`, matching pending_request_id below --
+     * s_pending.op is leftover from the last operation even after
+     * clear_pending(), and reporting it unconditionally made a completed
+     * operation look like it was still pending. */
+    e->pending_op = s_pending.active ? (uint8_t)s_pending.op : (uint8_t)BLE_CENTRAL_OP_NONE;
+    e->pending_request_id = s_pending.active ? s_pending.request_id : -1;
+    e->result_code = result_code;
+    s_trace_total++;
+    s_state = new_state;
+}
+
+static void set_reject(ble_central_reject_reason_t reason, const char *char_uuid)
+{
+    s_last_reject.reason = reason;
+    s_last_reject.state = s_state;
+    s_last_reject.conn_handle = s_conn_handle;
+    s_last_reject.pending_active = s_pending.active;
+    s_last_reject.pending_op = s_pending.active ? s_pending.op : BLE_CENTRAL_OP_NONE;
+    s_last_reject.pending_request_id = s_pending.active ? s_pending.request_id : -1;
+    if (char_uuid != NULL) {
+        strlcpy(s_last_reject.characteristic_uuid, char_uuid, sizeof(s_last_reject.characteristic_uuid));
+        s_last_reject.characteristic_cached = (ble_central_find_char_val_handle(char_uuid) != 0xFFFF);
+    } else {
+        s_last_reject.characteristic_uuid[0] = '\0';
+        s_last_reject.characteristic_cached = false;
+    }
+}
+
+/* Best-effort symbolic names for the standard Bluetooth Core Spec HCI
+ * Error Codes most relevant to an unexpected disconnect. Anything not
+ * listed here is preserved numerically as "UNKNOWN_0xNN" -- never
+ * silently discarded (BLE-D4.0B Step 4).
+ *
+ * NimBLE wraps an HCI-status-derived host error through
+ * BLE_HS_HCI_ERR(x) = BLE_HS_ERR_HCI_BASE(0x200) + x (host/ble_hs.h), and
+ * event->disconnect.reason arrives already wrapped this way for the
+ * common case (e.g. a locally-initiated ble_gap_terminate() reliably
+ * produces 0x216 = 0x200 + 0x16 "local host terminated", confirmed live
+ * on real hardware). Unwrap that base before the symbolic lookup, while
+ * `reason_code` itself keeps the untouched raw value. */
+static const char *hci_reason_name(int reason)
+{
+    if (reason >= 0x200 && reason <= 0x2FF) {
+        reason -= 0x200;
+    }
+    switch (reason) {
+        case 0x08: return "CONNECTION_TIMEOUT";           /* supervision timeout */
+        case 0x13: return "REMOTE_USER_TERMINATED";
+        case 0x14: return "REMOTE_LOW_RESOURCES";
+        case 0x15: return "REMOTE_POWER_OFF";
+        case 0x16: return "LOCAL_HOST_TERMINATED";
+        case 0x1F: return "UNSPECIFIED_ERROR";
+        case 0x22: return "LMP_RESPONSE_TIMEOUT";
+        case 0x28: return "INSTANT_PASSED";
+        case 0x2F: return "INSUFFICIENT_SECURITY";
+        case 0x3B: return "UNACCEPTABLE_CONN_PARAMS";
+        case 0x3D: return "CONN_FAILED_TO_ESTABLISH";
+        case 0x3E: return "CONN_FAILED_TO_ESTABLISH_SYNC_TIMEOUT";
+        default:   return NULL;
+    }
+}
+
+static void record_disconnect(uint16_t conn_handle, int reason)
+{
+    s_last_disconnect.valid = true;
+    s_last_disconnect.reason_code = reason;
+    const char *name = hci_reason_name(reason);
+    if (name != NULL) {
+        strlcpy(s_last_disconnect.reason_name, name, sizeof(s_last_disconnect.reason_name));
+    } else {
+        snprintf(s_last_disconnect.reason_name, sizeof(s_last_disconnect.reason_name), "UNKNOWN_0x%02X", reason);
+    }
+    s_last_disconnect.locally_initiated = s_local_disconnect_requested;
+    s_last_disconnect.conn_handle = conn_handle;
+    s_last_disconnect.previous_state = (uint8_t)s_state;
+    s_last_disconnect.had_pending_op = s_pending.active;
+    s_last_disconnect.pending_op_at_disconnect = s_pending.active ? (uint8_t)s_pending.op : (uint8_t)BLE_CENTRAL_OP_NONE;
+    s_last_disconnect.pending_request_id_at_disconnect = s_pending.active ? s_pending.request_id : -1;
+    s_last_disconnect.timestamp_ms = now_ms();
+    s_last_disconnect.connection_duration_ms = s_connect_established_ms > 0
+        ? (uint32_t)(s_last_disconnect.timestamp_ms - s_connect_established_ms)
+        : 0;
+    s_local_disconnect_requested = false;
+    s_connect_established_ms = 0;
+}
 
 /* ---------------------------------------------------------------------
  * UUID / address helpers
@@ -173,10 +352,10 @@ static void timeout_timer_cb(TimerHandle_t t)
 
     if (op == BLE_CENTRAL_OP_SCAN) {
         ble_gap_disc_cancel();
-        s_state = BLE_CENTRAL_STATE_IDLE;
+        set_state(BLE_CENTRAL_STATE_IDLE, "scan_timeout", 0);
     } else if (op == BLE_CENTRAL_OP_CONNECT) {
         ble_gap_conn_cancel();
-        s_state = BLE_CENTRAL_STATE_IDLE;
+        set_state(BLE_CENTRAL_STATE_IDLE, "connect_timeout", 0);
     }
     /* GATT ops (discovery/read/write/subscribe): nothing to actively
      * cancel in NimBLE; we just stop waiting. Any late callback will see
@@ -209,10 +388,10 @@ static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     int64_t id = s_pending.request_id;
     clear_pending();
     if (error->status == BLE_HS_EDONE) {
-        s_state = BLE_CENTRAL_STATE_READY;
+        set_state(BLE_CENTRAL_STATE_READY, "svc_disc_done", 0);
         command_dispatcher_on_svc_disc_done(id, s_services, s_service_count);
     } else {
-        s_state = BLE_CENTRAL_STATE_CONNECTED;
+        set_state(BLE_CENTRAL_STATE_CONNECTED, "svc_disc_failed", (int32_t)error->status);
         command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "service discovery error");
     }
     return 0;
@@ -239,10 +418,10 @@ static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     int64_t id = s_pending.request_id;
     clear_pending();
     if (error->status == BLE_HS_EDONE) {
-        s_state = BLE_CENTRAL_STATE_READY;
+        set_state(BLE_CENTRAL_STATE_READY, "chr_disc_done", 0);
         command_dispatcher_on_chr_disc_done(id, s_chrs, s_chr_count);
     } else {
-        s_state = BLE_CENTRAL_STATE_READY;
+        set_state(BLE_CENTRAL_STATE_READY, "chr_disc_failed", (int32_t)error->status);
         command_dispatcher_on_op_error(id, "DISCOVERY_FAILED", "characteristic discovery error");
     }
     return 0;
@@ -256,7 +435,7 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     if (!op_is_current(gen)) return 0;
     int64_t id = s_pending.request_id;
     clear_pending();
-    s_state = BLE_CENTRAL_STATE_READY;
+    set_state(BLE_CENTRAL_STATE_READY, "read_done", (int32_t)error->status);
 
     if (error->status != 0) {
         command_dispatcher_on_op_error(id, "READ_FAILED", "GATT read error");
@@ -280,7 +459,7 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     int64_t id = s_pending.request_id;
     ble_central_op_t op = s_pending.op;
     clear_pending();
-    s_state = BLE_CENTRAL_STATE_READY;
+    set_state(BLE_CENTRAL_STATE_READY, "write_done", (int32_t)error->status);
 
     if (error->status != 0) {
         command_dispatcher_on_op_error(id, "WRITE_FAILED", "GATT write error");
@@ -359,7 +538,7 @@ static void report_scan_match(const struct ble_gap_disc_desc *disc)
         conn_params.itvl_max = 40;
         conn_params.latency = 0;
         conn_params.supervision_timeout = 256;
-        s_state = BLE_CENTRAL_STATE_CONNECTING;
+        set_state(BLE_CENTRAL_STATE_CONNECTING, "connect_by_name_resolved", 0);
         ble_gap_connect(s_own_addr_type, &disc->addr, 10000, &conn_params,
                          gap_event_cb, (void *)(uintptr_t)gen);
     }
@@ -403,7 +582,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
             if (event->connect.status == 0) {
                 s_conn_handle = event->connect.conn_handle;
-                s_state = BLE_CENTRAL_STATE_CONNECTED;
+                s_connect_established_ms = now_ms();
+                set_state(BLE_CENTRAL_STATE_CONNECTED, "gap_connected", 0);
                 struct ble_gap_conn_desc desc;
                 ble_gap_conn_find(s_conn_handle, &desc);
                 addr_to_str(&desc.peer_id_addr, s_peer_addr_str, sizeof(s_peer_addr_str));
@@ -411,16 +591,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
                 command_dispatcher_on_connected(id, s_peer_addr_str, s_peer_name);
             } else {
-                s_state = BLE_CENTRAL_STATE_IDLE;
+                set_state(BLE_CENTRAL_STATE_IDLE, "gap_connect_failed", (int32_t)event->connect.status);
                 command_dispatcher_on_connect_failed(id, "CONNECT_FAILED", "GAP connect failed");
             }
         }
         return 0;
 
-    case BLE_GAP_EVENT_DISCONNECT:
-        if (event->disconnect.conn.conn_handle == s_conn_handle) {
+    case BLE_GAP_EVENT_DISCONNECT: {
+        uint16_t disconnected_handle = event->disconnect.conn.conn_handle;
+        if (disconnected_handle == s_conn_handle) {
+            /* Capture the real reason and full context BEFORE clearing any
+             * of it -- record_disconnect() and set_state() both read
+             * s_pending/s_state/s_conn_handle as they currently stand. */
+            record_disconnect(disconnected_handle, event->disconnect.reason);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            s_state = BLE_CENTRAL_STATE_IDLE;
+            set_state(BLE_CENTRAL_STATE_IDLE, "gap_disconnect", event->disconnect.reason);
             s_service_count = 0;
             s_chr_count = 0;
             s_mtu = 23;
@@ -429,9 +614,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                 clear_pending();
                 command_dispatcher_on_op_error(id, "DISCONNECTED", "peer disconnected mid-operation");
             }
-            command_dispatcher_on_disconnected("peer_disconnect");
+            /* BLE-D4.0B Step 4: report the real captured reason, never the
+             * old hardcoded "peer_disconnect" string regardless of cause. */
+            command_dispatcher_on_disconnected(s_last_disconnect.reason_name);
         }
         return 0;
+    }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
         const char *uuid_str = NULL;
@@ -447,8 +635,28 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (len > BLE_CENTRAL_MAX_READ_LEN) len = BLE_CENTRAL_MAX_READ_LEN;
         uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
         os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
-        command_dispatcher_on_notification(event->notify_rx.attr_handle, uuid_str, buf, len,
-                                             event->notify_rx.indication);
+
+        /* BLE-D4.0C Step 4: cheap counters only, no logging, updated here
+         * and read back later from a safe task context (cmd_diag_health). */
+        s_notify_count++;
+        s_notify_bytes += len;
+        uint32_t free_now = (uint32_t)esp_get_free_heap_size();
+        if (free_now < s_min_free_internal_heap_ever) s_min_free_internal_heap_ever = free_now;
+
+        /* BLE-D4.0C Step 6, Test A: while local-hash mode is enabled, a
+         * File Transfer Data notification is hashed locally INSTEAD of
+         * forwarded over UART -- this is what removes UART/Python from
+         * the data path. Every other characteristic (Command Response,
+         * Status, etc.) keeps forwarding normally regardless, so the
+         * Python driver can still see phase/completion events. */
+        bool is_file_transfer_data = (uuid_str != NULL) &&
+            (strcasecmp(uuid_str, HLV_CHAR_FILE_TRANSFER_DATA_UUID) == 0);
+        if (is_file_transfer_data && file_transfer_hash_is_enabled()) {
+            file_transfer_hash_ingest(buf, len);
+        } else {
+            command_dispatcher_on_notification(event->notify_rx.attr_handle, uuid_str, buf, len,
+                                                 event->notify_rx.indication);
+        }
         return 0;
     }
 
@@ -467,26 +675,28 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
 static void on_reset(int reason)
 {
-    (void)reason;
-    s_state = BLE_CENTRAL_STATE_ERROR;
+    set_state(BLE_CENTRAL_STATE_ERROR, "host_reset", reason);
 }
 
 static void on_sync(void)
 {
     ble_hs_util_ensure_addr(0);
     ble_hs_id_infer_auto(0, &s_own_addr_type);
-    s_state = BLE_CENTRAL_STATE_IDLE;
+    set_state(BLE_CENTRAL_STATE_IDLE, "host_sync", 0);
 }
 
 static void host_task(void *param)
 {
     (void)param;
+    s_host_task_handle = xTaskGetCurrentTaskHandle();
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
 
 void ble_central_init(void)
 {
+    record_boot();
+    file_transfer_hash_init();
     memset(&s_pending, 0, sizeof(s_pending));
     nimble_port_init();
 
@@ -538,7 +748,8 @@ bool ble_central_scan_start(int64_t request_id, uint32_t timeout_ms,
                              const char *name_filter, const char *addr_filter,
                              const char *service_uuid_filter)
 {
-    if (s_pending.active || s_state != BLE_CENTRAL_STATE_IDLE) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, NULL); return false; }
+    if (s_state != BLE_CENTRAL_STATE_IDLE) { set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL); return false; }
 
     struct ble_gap_disc_params params;
     memset(&params, 0, sizeof(params));
@@ -559,9 +770,10 @@ bool ble_central_scan_start(int64_t request_id, uint32_t timeout_ms,
     int rc = ble_gap_disc(s_own_addr_type, timeout_ms, &params, gap_event_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
         return false;
     }
-    s_state = BLE_CENTRAL_STATE_SCANNING;
+    set_state(BLE_CENTRAL_STATE_SCANNING, "scan_start", 0);
     return true;
 }
 
@@ -575,8 +787,12 @@ bool ble_central_scan_stop(void)
 bool ble_central_connect_start(int64_t request_id, uint32_t timeout_ms,
                                 const char *addr, const char *name)
 {
-    if (s_pending.active || s_state != BLE_CENTRAL_STATE_IDLE) return false;
-    if ((addr == NULL || addr[0] == '\0') && (name == NULL || name[0] == '\0')) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, NULL); return false; }
+    if (s_state != BLE_CENTRAL_STATE_IDLE) { set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL); return false; }
+    if ((addr == NULL || addr[0] == '\0') && (name == NULL || name[0] == '\0')) {
+        set_reject(BLE_CENTRAL_REJECT_INVALID_ARGUMENT, NULL);
+        return false;
+    }
 
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_CONNECT, request_id, timeout_ms);
     s_pending.connect_name[0] = '\0';
@@ -585,6 +801,7 @@ bool ble_central_connect_start(int64_t request_id, uint32_t timeout_ms,
         ble_addr_t peer;
         if (!str_to_addr(addr, &peer)) {
             clear_pending();
+            set_reject(BLE_CENTRAL_REJECT_INVALID_ARGUMENT, NULL);
             return false;
         }
         struct ble_gap_conn_params conn_params;
@@ -598,9 +815,10 @@ bool ble_central_connect_start(int64_t request_id, uint32_t timeout_ms,
                                   gap_event_cb, (void *)(uintptr_t)gen);
         if (rc != 0) {
             clear_pending();
+            set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
             return false;
         }
-        s_state = BLE_CENTRAL_STATE_CONNECTING;
+        set_state(BLE_CENTRAL_STATE_CONNECTING, "connect_start_addr", 0);
         return true;
     }
 
@@ -622,23 +840,31 @@ bool ble_central_connect_start(int64_t request_id, uint32_t timeout_ms,
     int rc = ble_gap_disc(s_own_addr_type, timeout_ms, &params, gap_event_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
         return false;
     }
-    s_state = BLE_CENTRAL_STATE_CONNECTING;
+    set_state(BLE_CENTRAL_STATE_CONNECTING, "connect_start_name_scan", 0);
     return true;
 }
 
 bool ble_central_disconnect_start(int64_t request_id)
 {
     if (s_state == BLE_CENTRAL_STATE_CONNECTING) {
+        /* No real GAP connection ever existed yet, so no BLE_GAP_EVENT_DISCONNECT
+         * will follow -- do NOT set s_local_disconnect_requested here, or it
+         * would incorrectly leak forward and mislabel the NEXT real disconnect. */
         ble_gap_conn_cancel();
         clear_pending();
-        s_state = BLE_CENTRAL_STATE_IDLE;
+        set_state(BLE_CENTRAL_STATE_IDLE, "connect_cancelled", 0);
         command_dispatcher_on_disconnected("connect_cancelled");
         return true;
     }
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
-    s_state = BLE_CENTRAL_STATE_DISCONNECTING;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        set_reject(BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED, NULL);
+        return false;
+    }
+    s_local_disconnect_requested = true;
+    set_state(BLE_CENTRAL_STATE_DISCONNECTING, "disconnect_requested", 0);
     ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     (void)request_id; /* completion arrives via BLE_GAP_EVENT_DISCONNECT */
     return true;
@@ -646,16 +872,21 @@ bool ble_central_disconnect_start(int64_t request_id)
 
 bool ble_central_disc_services_start(int64_t request_id, uint32_t timeout_ms)
 {
-    if (s_pending.active) return false;
-    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, NULL); return false; }
+    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) {
+        set_reject(s_conn_handle == BLE_HS_CONN_HANDLE_NONE
+                        ? BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED : BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
+        return false;
+    }
 
     s_service_count = 0;
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_DISC_SERVICES, request_id, timeout_ms);
-    s_state = BLE_CENTRAL_STATE_DISCOVERING;
+    set_state(BLE_CENTRAL_STATE_DISCOVERING, "svc_disc_start", 0);
     int rc = ble_gattc_disc_all_svcs(s_conn_handle, disc_svc_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
-        s_state = BLE_CENTRAL_STATE_CONNECTED;
+        set_state(BLE_CENTRAL_STATE_CONNECTED, "svc_disc_start_failed", rc);
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
         return false;
     }
     return true;
@@ -664,8 +895,12 @@ bool ble_central_disc_services_start(int64_t request_id, uint32_t timeout_ms)
 bool ble_central_disc_characteristics_start(int64_t request_id, uint32_t timeout_ms,
                                              const char *service_uuid)
 {
-    if (s_pending.active) return false;
-    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, NULL); return false; }
+    if (s_state != BLE_CENTRAL_STATE_CONNECTED && s_state != BLE_CENTRAL_STATE_READY) {
+        set_reject(s_conn_handle == BLE_HS_CONN_HANDLE_NONE
+                        ? BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED : BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
+        return false;
+    }
 
     uint16_t start = 0x0001, end = 0xFFFF;
     if (service_uuid != NULL && service_uuid[0] != '\0') {
@@ -678,16 +913,17 @@ bool ble_central_disc_characteristics_start(int64_t request_id, uint32_t timeout
                 break;
             }
         }
-        if (!found) return false;
+        if (!found) { set_reject(BLE_CENTRAL_REJECT_SERVICE_NOT_DISCOVERED, service_uuid); return false; }
     }
 
     s_chr_count = 0;
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_DISC_CHARACTERISTICS, request_id, timeout_ms);
-    s_state = BLE_CENTRAL_STATE_DISCOVERING;
+    set_state(BLE_CENTRAL_STATE_DISCOVERING, "chr_disc_start", 0);
     int rc = ble_gattc_disc_all_chrs(s_conn_handle, start, end, disc_chr_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
-        s_state = BLE_CENTRAL_STATE_READY;
+        set_state(BLE_CENTRAL_STATE_READY, "chr_disc_start_failed", rc);
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, NULL);
         return false;
     }
     return true;
@@ -695,15 +931,20 @@ bool ble_central_disc_characteristics_start(int64_t request_id, uint32_t timeout
 
 bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid)
 {
-    if (s_pending.active) return false;
-    if (s_state != BLE_CENTRAL_STATE_READY) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, char_uuid); return false; }
+    if (s_state != BLE_CENTRAL_STATE_READY) {
+        set_reject(s_conn_handle == BLE_HS_CONN_HANDLE_NONE
+                        ? BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED : BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
+        return false;
+    }
     uint16_t handle = ble_central_find_char_val_handle(char_uuid);
-    if (handle == 0xFFFF) return false;
+    if (handle == 0xFFFF) { set_reject(BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED, char_uuid); return false; }
 
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_READ, request_id, timeout_ms);
     int rc = ble_gattc_read(s_conn_handle, handle, read_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
         return false;
     }
     return true;
@@ -712,11 +953,15 @@ bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char 
 bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
                               const uint8_t *data, size_t len, bool with_response)
 {
-    if (s_pending.active) return false;
-    if (s_state != BLE_CENTRAL_STATE_READY) return false;
-    if (len > BLE_CENTRAL_MAX_READ_LEN) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, char_uuid); return false; }
+    if (s_state != BLE_CENTRAL_STATE_READY) {
+        set_reject(s_conn_handle == BLE_HS_CONN_HANDLE_NONE
+                        ? BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED : BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
+        return false;
+    }
+    if (len > BLE_CENTRAL_MAX_READ_LEN) { set_reject(BLE_CENTRAL_REJECT_PAYLOAD_TOO_LARGE, char_uuid); return false; }
     uint16_t handle = ble_central_find_char_val_handle(char_uuid);
-    if (handle == 0xFFFF) return false;
+    if (handle == 0xFFFF) { set_reject(BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED, char_uuid); return false; }
 
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_WRITE, request_id, timeout_ms);
     memcpy(s_pending.write_buf, data, len);
@@ -736,6 +981,7 @@ bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char
     }
     if (rc != 0) {
         clear_pending();
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
         return false;
     }
     return true;
@@ -744,10 +990,14 @@ bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char
 static bool subscribe_common(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
                               const uint8_t *cccd_value, ble_central_op_t op)
 {
-    if (s_pending.active) return false;
-    if (s_state != BLE_CENTRAL_STATE_READY) return false;
+    if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, char_uuid); return false; }
+    if (s_state != BLE_CENTRAL_STATE_READY) {
+        set_reject(s_conn_handle == BLE_HS_CONN_HANDLE_NONE
+                        ? BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED : BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
+        return false;
+    }
     uint16_t val_handle = ble_central_find_char_val_handle(char_uuid);
-    if (val_handle == 0xFFFF) return false;
+    if (val_handle == 0xFFFF) { set_reject(BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED, char_uuid); return false; }
     /* CCCD is the descriptor immediately following the value attribute
      * -- true for every NimBLE-GATT-server characteristic that declares
      * NOTIFY/INDICATE with no other descriptor ahead of it, which is how
@@ -764,6 +1014,7 @@ static bool subscribe_common(int64_t request_id, uint32_t timeout_ms, const char
                                     write_cb, (void *)(uintptr_t)gen);
     if (rc != 0) {
         clear_pending();
+        set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
         return false;
     }
     return true;
@@ -791,6 +1042,7 @@ void ble_central_reset(void)
 {
     clear_pending();
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        s_local_disconnect_requested = true;
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     if (s_state == BLE_CENTRAL_STATE_SCANNING) {
@@ -798,5 +1050,56 @@ void ble_central_reset(void)
     }
     s_service_count = 0;
     s_chr_count = 0;
-    s_state = BLE_CENTRAL_STATE_IDLE;
+    set_state(BLE_CENTRAL_STATE_IDLE, "reset", 0);
+}
+
+/* ---------------------------------------------------------------------
+ * BLE-D4.0B diagnostics accessors
+ * ------------------------------------------------------------------- */
+
+const ble_central_reject_info_t *ble_central_last_reject_info(void) { return &s_last_reject; }
+const ble_central_disconnect_info_t *ble_central_last_disconnect_info(void) { return &s_last_disconnect; }
+uint32_t ble_central_trace_total_count(void) { return s_trace_total; }
+
+bool ble_central_trace_get(uint32_t logical_index, ble_central_trace_entry_t *out)
+{
+    if (logical_index >= s_trace_total) return false;
+    if (logical_index >= BLE_CENTRAL_TRACE_DEPTH) return false;
+    uint32_t slot = (s_trace_total - 1 - logical_index) % BLE_CENTRAL_TRACE_DEPTH;
+    *out = s_trace[slot];
+    return true;
+}
+
+/* ---------------------------------------------------------------------
+ * BLE-D4.0C boot/health diagnostics accessors (Steps 1 and 4)
+ * ------------------------------------------------------------------- */
+
+void ble_central_get_boot_info(ble_central_boot_info_t *out)
+{
+    out->reset_reason_code = (int32_t)s_reset_reason;
+    const char *name = reset_reason_name(s_reset_reason);
+    if (name != NULL) {
+        strlcpy(out->reset_reason_name, name, sizeof(out->reset_reason_name));
+    } else {
+        snprintf(out->reset_reason_name, sizeof(out->reset_reason_name), "UNKNOWN_%d", (int)s_reset_reason);
+    }
+    out->boot_generation = s_boot_generation;
+    out->uptime_ms = (uint32_t)(now_ms() - s_boot_uptime_base_ms);
+}
+
+void ble_central_get_health(ble_central_health_t *out)
+{
+    out->free_internal_heap = (uint32_t)esp_get_free_heap_size();
+    if (out->free_internal_heap < s_min_free_internal_heap_ever) {
+        s_min_free_internal_heap_ever = out->free_internal_heap; /* catch a dip since the last notify, too */
+    }
+    out->minimum_free_internal_heap = s_min_free_internal_heap_ever;
+    out->largest_free_internal_block = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    out->notifications_received = s_notify_count;
+    out->notification_bytes_received = s_notify_bytes;
+    out->nimble_host_task_stack_highwater_words = s_host_task_handle != NULL
+        ? (uint32_t)uxTaskGetStackHighWaterMark(s_host_task_handle)
+        : 0;
+    out->pending_operation_active = s_pending.active;
+    out->state_transition_total = s_trace_total;
 }

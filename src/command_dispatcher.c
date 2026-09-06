@@ -4,6 +4,7 @@
 #include "ble_central.h"
 #include "holterlev_client.h"
 #include "holterlev_protocol_ref.h"
+#include "file_transfer_hash.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.1.0"
+#define FIRMWARE_VERSION      "0.2.2-diag"
 #define UART_PROTOCOL_VERSION "1.0"
 
 #define MIRROR_DATA_MAX   128
@@ -85,6 +86,22 @@ static const char *state_str(ble_central_state_t s)
     case BLE_CENTRAL_STATE_DISCONNECTING: return "DISCONNECTING";
     case BLE_CENTRAL_STATE_ERROR: return "ERROR";
     default: return "UNKNOWN";
+    }
+}
+
+static const char *central_op_name(ble_central_op_t op)
+{
+    switch (op) {
+        case BLE_CENTRAL_OP_NONE:                 return "NONE";
+        case BLE_CENTRAL_OP_SCAN:                 return "SCAN";
+        case BLE_CENTRAL_OP_CONNECT:               return "CONNECT";
+        case BLE_CENTRAL_OP_DISC_SERVICES:         return "DISC_SERVICES";
+        case BLE_CENTRAL_OP_DISC_CHARACTERISTICS:  return "DISC_CHARACTERISTICS";
+        case BLE_CENTRAL_OP_READ:                  return "READ";
+        case BLE_CENTRAL_OP_WRITE:                 return "WRITE";
+        case BLE_CENTRAL_OP_SUBSCRIBE:              return "SUBSCRIBE";
+        case BLE_CENTRAL_OP_UNSUBSCRIBE:            return "UNSUBSCRIBE";
+        default:                                    return "UNKNOWN";
     }
 }
 
@@ -301,6 +318,9 @@ static void cmd_version(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "holterlev_ble_protocol_major", HLV_PROTOCOL_VERSION_MAJOR);
     cJSON_AddNumberToObject(j, "holterlev_ble_protocol_minor", HLV_PROTOCOL_VERSION_MINOR);
     cJSON_AddStringToObject(j, "expected_advertised_name", HLV_ADVERTISED_NAME);
+    ble_central_boot_info_t b;
+    ble_central_get_boot_info(&b);
+    cJSON_AddNumberToObject(j, "boot_generation", b.boot_generation);
     protocol_json_send_ok(id, j);
 }
 
@@ -315,6 +335,150 @@ static void cmd_controller_status(int64_t id, cJSON *root)
         cJSON_AddStringToObject(j, "peer_name", ble_central_peer_name());
         cJSON_AddNumberToObject(j, "mtu", ble_central_negotiated_mtu());
     }
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0B Step 4/7: the real captured HCI disconnect reason and context,
+ * never the old hardcoded "peer_disconnect". `valid:false` means no
+ * disconnect has been observed yet since boot. */
+static void cmd_diag_disconnect(int64_t id, cJSON *root)
+{
+    (void)root;
+    const ble_central_disconnect_info_t *d = ble_central_last_disconnect_info();
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "valid", d->valid);
+    if (d->valid) {
+        cJSON_AddNumberToObject(j, "reason_code", d->reason_code);
+        cJSON_AddStringToObject(j, "reason_name", d->reason_name);
+        cJSON_AddBoolToObject(j, "locally_initiated", d->locally_initiated);
+        cJSON_AddNumberToObject(j, "conn_handle", d->conn_handle);
+        cJSON_AddStringToObject(j, "previous_state", state_str((ble_central_state_t)d->previous_state));
+        cJSON_AddBoolToObject(j, "had_pending_operation", d->had_pending_op);
+        if (d->had_pending_op) {
+            cJSON_AddStringToObject(j, "pending_operation_type", central_op_name((ble_central_op_t)d->pending_op_at_disconnect));
+            cJSON_AddNumberToObject(j, "pending_request_id", (double)d->pending_request_id_at_disconnect);
+        }
+        cJSON_AddNumberToObject(j, "connection_duration_ms", d->connection_duration_ms);
+        cJSON_AddNumberToObject(j, "timestamp_ms", (double)d->timestamp_ms);
+    }
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0B Step 5: dumps the bounded state-transition trace, most recent
+ * first. Optional "count" field caps how many entries are returned
+ * (default: all currently retained, up to BLE_CENTRAL_TRACE_DEPTH). */
+static void cmd_diag_trace(int64_t id, cJSON *root)
+{
+    uint32_t total = ble_central_trace_total_count();
+    uint32_t retained = total < BLE_CENTRAL_TRACE_DEPTH ? total : BLE_CENTRAL_TRACE_DEPTH;
+    uint32_t want = optional_uint32(root, "count", retained);
+    if (want > retained) want = retained;
+
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "total_transitions_since_boot", (double)total);
+    cJSON_AddNumberToObject(j, "retained_count", retained);
+    cJSON *arr = cJSON_CreateArray();
+    for (uint32_t i = 0; i < want; i++) {
+        ble_central_trace_entry_t e;
+        if (!ble_central_trace_get(i, &e)) break;
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "timestamp_ms", (double)e.timestamp_ms);
+        cJSON_AddStringToObject(item, "prev_state", state_str((ble_central_state_t)e.prev_state));
+        cJSON_AddStringToObject(item, "new_state", state_str((ble_central_state_t)e.new_state));
+        cJSON_AddStringToObject(item, "event", e.event);
+        cJSON_AddNumberToObject(item, "conn_handle", e.conn_handle);
+        cJSON_AddStringToObject(item, "pending_operation_type", central_op_name((ble_central_op_t)e.pending_op));
+        cJSON_AddNumberToObject(item, "pending_request_id", (double)e.pending_request_id);
+        cJSON_AddNumberToObject(item, "result_code", e.result_code);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddItemToObject(j, "transitions_most_recent_first", arr);
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0C Step 1: a fresh boot must be distinguishable from a BLE
+ * disconnect, a state-machine reset, or a UART reconnect -- boot_generation
+ * only advances on an actual chip reset (RTC memory, survives SW/panic/
+ * watchdog resets; a true power-on/brownout clears it back to 1). */
+static void cmd_diag_boot(int64_t id, cJSON *root)
+{
+    (void)root;
+    ble_central_boot_info_t b;
+    ble_central_get_boot_info(&b);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "reset_reason_code", b.reset_reason_code);
+    cJSON_AddStringToObject(j, "reset_reason", b.reset_reason_name);
+    cJSON_AddNumberToObject(j, "boot_generation", b.boot_generation);
+    cJSON_AddNumberToObject(j, "uptime_ms", b.uptime_ms);
+    cJSON_AddStringToObject(j, "firmware_version", FIRMWARE_VERSION);
+    cJSON_AddStringToObject(j, "build_timestamp", __DATE__ " " __TIME__);
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0C Step 4: bounded runtime health snapshot -- counters are updated
+ * cheaply inside the NimBLE notification callback (ble_central.c) and only
+ * read back here, from the UART command task, never logged per-packet. */
+static void cmd_diag_health(int64_t id, cJSON *root)
+{
+    (void)root;
+    ble_central_boot_info_t b;
+    ble_central_get_boot_info(&b);
+    ble_central_health_t h;
+    ble_central_get_health(&h);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "boot_generation", b.boot_generation);
+    cJSON_AddNumberToObject(j, "uptime_ms", b.uptime_ms);
+    cJSON_AddNumberToObject(j, "free_internal_heap", h.free_internal_heap);
+    cJSON_AddNumberToObject(j, "minimum_free_internal_heap", h.minimum_free_internal_heap);
+    cJSON_AddNumberToObject(j, "largest_free_internal_block", h.largest_free_internal_block);
+    cJSON_AddNumberToObject(j, "notifications_received", h.notifications_received);
+    cJSON_AddNumberToObject(j, "notification_bytes_received", h.notification_bytes_received);
+    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_words", h.nimble_host_task_stack_highwater_words);
+    cJSON_AddBoolToObject(j, "pending_operation_active", h.pending_operation_active);
+    cJSON_AddNumberToObject(j, "state_transition_total", h.state_transition_total);
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0C Step 6, Test A: toggles local-hash mode for the File Transfer
+ * Data characteristic. Enabling always resets the accumulator. */
+static void cmd_diag_file_hash_mode(int64_t id, cJSON *root)
+{
+    bool enable = get_bool(root, "enable", true);
+    file_transfer_hash_enable(enable);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "enabled", file_transfer_hash_is_enabled());
+    protocol_json_send_ok(id, j);
+}
+
+static void cmd_diag_file_hash_summary(int64_t id, cJSON *root)
+{
+    (void)root;
+    file_transfer_hash_summary_t s;
+    file_transfer_hash_get_summary(&s);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "enabled", file_transfer_hash_is_enabled());
+    cJSON_AddNumberToObject(j, "boot_generation_start", s.boot_generation_start);
+    cJSON_AddNumberToObject(j, "boot_generation_end", s.boot_generation_end);
+    cJSON_AddNumberToObject(j, "notifications_received", s.notifications_received);
+    cJSON_AddNumberToObject(j, "bytes_received", s.bytes_received);
+    if (s.has_first_offset) cJSON_AddNumberToObject(j, "first_offset", s.first_offset);
+    cJSON_AddNumberToObject(j, "last_offset", s.last_offset);
+    if (s.has_gap) cJSON_AddNumberToObject(j, "first_gap_offset", s.first_gap_offset);
+    cJSON_AddNumberToObject(j, "gap_count", s.gap_count);
+    cJSON_AddNumberToObject(j, "duplicate_count", s.duplicate_count);
+    cJSON_AddNumberToObject(j, "out_of_order_count", s.out_of_order_count);
+    cJSON_AddNumberToObject(j, "crc32", s.crc32);
+    cJSON_AddStringToObject(j, "sha256", s.sha256_hex);
+    cJSON_AddNumberToObject(j, "elapsed_ms", s.elapsed_ms);
+
+    ble_central_boot_info_t b;
+    ble_central_get_boot_info(&b);
+    cJSON_AddStringToObject(j, "reset_reason", b.reset_reason_name);
+    ble_central_health_t h;
+    ble_central_get_health(&h);
+    cJSON_AddNumberToObject(j, "minimum_free_internal_heap", h.minimum_free_internal_heap);
+    cJSON_AddNumberToObject(j, "nimble_host_task_stack_highwater_words", h.nimble_host_task_stack_highwater_words);
+
     protocol_json_send_ok(id, j);
 }
 
@@ -390,13 +554,52 @@ static void cmd_discover_characteristics(int64_t id, cJSON *root)
     }
 }
 
+/* BLE-D4.0B Step 3: distinguishes the conditions the old single
+ * "INVALID_STATE: not READY, or characteristic not discovered" string
+ * conflated, and reports enough structured state to identify the exact
+ * rejected condition without guessing (Step 3 requirement list). */
+static const char *reject_reason_code(ble_central_reject_reason_t reason)
+{
+    switch (reason) {
+        case BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED:            return "LINK_NOT_CONNECTED";
+        case BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING:        return "GATT_OPERATION_PENDING";
+        case BLE_CENTRAL_REJECT_CENTRAL_NOT_READY:             return "CENTRAL_NOT_READY";
+        case BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED: return "CHARACTERISTIC_NOT_DISCOVERED";
+        case BLE_CENTRAL_REJECT_SERVICE_NOT_DISCOVERED:        return "SERVICE_NOT_DISCOVERED";
+        case BLE_CENTRAL_REJECT_PAYLOAD_TOO_LARGE:             return "PAYLOAD_TOO_LARGE";
+        case BLE_CENTRAL_REJECT_INVALID_ARGUMENT:              return "INVALID_ARGUMENT";
+        default:                                               return "CENTRAL_NOT_READY";
+    }
+}
+
+static void send_reject_error(int64_t id)
+{
+    const ble_central_reject_info_t *r = ble_central_last_reject_info();
+    cJSON *extra = cJSON_CreateObject();
+    cJSON_AddStringToObject(extra, "central_state", state_str(r->state));
+    cJSON_AddNumberToObject(extra, "conn_handle", r->conn_handle);
+    cJSON_AddBoolToObject(extra, "pending_operation_active", r->pending_active);
+    cJSON_AddStringToObject(extra, "pending_operation_type", central_op_name(r->pending_op));
+    cJSON_AddNumberToObject(extra, "pending_request_id", (double)r->pending_request_id);
+    if (r->characteristic_uuid[0] != '\0') {
+        cJSON_AddStringToObject(extra, "required_characteristic_uuid", r->characteristic_uuid);
+        cJSON_AddBoolToObject(extra, "characteristic_cached", r->characteristic_cached);
+    }
+    const ble_central_disconnect_info_t *d = ble_central_last_disconnect_info();
+    if (d->valid) {
+        cJSON_AddStringToObject(extra, "last_disconnect_reason", d->reason_name);
+    }
+    protocol_json_send_error_ex(id, reject_reason_code(r->reason),
+                                 "see structured fields for the exact rejected condition", extra);
+}
+
 static void cmd_read(int64_t id, cJSON *root)
 {
     const char *uuid;
     if (!require_string(id, root, "characteristic", &uuid)) return;
     uint32_t timeout_ms = optional_uint32(root, "timeout_ms", 5000);
     if (!ble_central_read_start(id, timeout_ms, uuid)) {
-        protocol_json_send_error(id, "INVALID_STATE", "not READY, or characteristic not discovered");
+        send_reject_error(id);
     }
 }
 
@@ -416,7 +619,7 @@ static void cmd_write(int64_t id, cJSON *root)
         return;
     }
     if (!ble_central_write_start(id, timeout_ms, uuid, buf, (size_t)len, with_response)) {
-        protocol_json_send_error(id, "INVALID_STATE", "not READY, or characteristic not discovered");
+        send_reject_error(id);
     }
 }
 
@@ -428,7 +631,7 @@ static void cmd_subscribe(int64_t id, cJSON *root)
     const char *mode = get_string(root, "mode");
     bool indicate = (mode != NULL && strcasecmp(mode, "indicate") == 0);
     if (!ble_central_subscribe_start(id, timeout_ms, uuid, indicate)) {
-        protocol_json_send_error(id, "INVALID_STATE", "not READY, or characteristic not discovered");
+        send_reject_error(id);
     }
 }
 
@@ -438,7 +641,7 @@ static void cmd_unsubscribe(int64_t id, cJSON *root)
     if (!require_string(id, root, "characteristic", &uuid)) return;
     uint32_t timeout_ms = optional_uint32(root, "timeout_ms", 5000);
     if (!ble_central_unsubscribe_start(id, timeout_ms, uuid)) {
-        protocol_json_send_error(id, "INVALID_STATE", "not READY, or characteristic not discovered");
+        send_reject_error(id);
     }
 }
 
@@ -631,6 +834,12 @@ void command_dispatcher_handle_line(char *line)
     else if (strcmp(cmd, "wait_event") == 0) cmd_wait_event(id, root);
     else if (strcmp(cmd, "clear_bonds") == 0) cmd_clear_bonds(id, root);
     else if (strcmp(cmd, "reset_controller") == 0) cmd_reset_controller(id, root);
+    else if (strcmp(cmd, "diag_disconnect") == 0) cmd_diag_disconnect(id, root);
+    else if (strcmp(cmd, "diag_trace") == 0) cmd_diag_trace(id, root);
+    else if (strcmp(cmd, "diag_boot") == 0) cmd_diag_boot(id, root);
+    else if (strcmp(cmd, "diag_health") == 0) cmd_diag_health(id, root);
+    else if (strcmp(cmd, "diag_file_hash_mode") == 0) cmd_diag_file_hash_mode(id, root);
+    else if (strcmp(cmd, "diag_file_hash_summary") == 0) cmd_diag_file_hash_summary(id, root);
     else if (strcmp(cmd, "holter_connect") == 0) cmd_holter_connect(id, root);
     else if (strcmp(cmd, "holter_authenticate") == 0) cmd_holter_authenticate(id, root);
     else if (strcmp(cmd, "holter_get_status") == 0) cmd_holter_get_status(id, root);

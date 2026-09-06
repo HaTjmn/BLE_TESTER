@@ -117,6 +117,105 @@ void ble_central_reset(void);
  * handle). */
 uint16_t ble_central_find_char_val_handle(const char *char_uuid);
 
+/* -----------------------------------------------------------------------
+ * BLE-D4.0B diagnostics -- WHY a *_start() call returned false, the real
+ * HCI disconnect reason, and a bounded state-transition trace. Purely
+ * additive: no *_start() signature or externally-visible success path
+ * changes; command_dispatcher.c uses these to turn one generic
+ * INVALID_STATE into the specific rejected condition.
+ * --------------------------------------------------------------------- */
+
+typedef enum {
+    BLE_CENTRAL_REJECT_NONE = 0,
+    BLE_CENTRAL_REJECT_LINK_NOT_CONNECTED,             /* no GAP connection at all */
+    BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING,         /* s_pending.active */
+    BLE_CENTRAL_REJECT_CENTRAL_NOT_READY,              /* connected but not yet READY (mid-discovery, etc.) */
+    BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED,  /* val handle lookup failed */
+    BLE_CENTRAL_REJECT_SERVICE_NOT_DISCOVERED,         /* service_uuid lookup failed */
+    BLE_CENTRAL_REJECT_PAYLOAD_TOO_LARGE,
+    BLE_CENTRAL_REJECT_INVALID_ARGUMENT,
+} ble_central_reject_reason_t;
+
+typedef struct {
+    ble_central_reject_reason_t reason;
+    ble_central_state_t         state;
+    uint16_t                    conn_handle;
+    bool                        pending_active;
+    ble_central_op_t            pending_op;
+    int64_t                     pending_request_id;
+    char                        characteristic_uuid[BLE_CENTRAL_UUID_STR_LEN];
+    bool                        characteristic_cached;
+} ble_central_reject_info_t;
+
+/* Snapshot of the most recent *_start() rejection (single global slot --
+ * safe here because exactly one UART command is dispatched/processed at a
+ * time, matching this codebase's existing one-pending-op design). */
+const ble_central_reject_info_t *ble_central_last_reject_info(void);
+
+typedef struct {
+    bool     valid;               /* false until the first disconnect is ever observed */
+    int32_t  reason_code;         /* raw HCI/NimBLE reason, preserved even if unrecognized */
+    char     reason_name[28];     /* best-effort symbolic name, "UNKNOWN_0xNN" if not recognized */
+    bool     locally_initiated;   /* true if THIS side called ble_gap_terminate/disc_cancel */
+    uint16_t conn_handle;
+    uint8_t  previous_state;      /* ble_central_state_t at the moment of disconnect */
+    uint8_t  pending_op_at_disconnect;
+    int64_t  pending_request_id_at_disconnect;
+    bool     had_pending_op;
+    uint32_t connection_duration_ms;
+    int64_t  timestamp_ms;
+} ble_central_disconnect_info_t;
+
+const ble_central_disconnect_info_t *ble_central_last_disconnect_info(void);
+
+#define BLE_CENTRAL_TRACE_DEPTH 64
+
+typedef struct {
+    int64_t  timestamp_ms;
+    uint8_t  prev_state;
+    uint8_t  new_state;
+    char     event[24];
+    uint16_t conn_handle;
+    uint8_t  pending_op;
+    int64_t  pending_request_id;
+    int32_t  result_code;   /* 0 = n/a, else an HCI/NimBLE status or reason */
+} ble_central_trace_entry_t;
+
+/* Total transitions recorded since boot (monotonically increasing, may
+ * exceed BLE_CENTRAL_TRACE_DEPTH -- only the most recent DEPTH are kept). */
+uint32_t ble_central_trace_total_count(void);
+
+/* Fetches the trace entry `logical_index` slots back from the most recent
+ * (0 = most recent). Returns false if that far back is no longer retained
+ * or was never recorded. */
+bool ble_central_trace_get(uint32_t logical_index, ble_central_trace_entry_t *out);
+
+/* -----------------------------------------------------------------------
+ * BLE-D4.0C boot/reset and runtime-health diagnostics.
+ * --------------------------------------------------------------------- */
+
+typedef struct {
+    int32_t  reset_reason_code;          /* raw esp_reset_reason_t value */
+    char     reset_reason_name[20];      /* symbolic name, "UNKNOWN_N" if unrecognized */
+    uint32_t boot_generation;            /* survives SW/panic/watchdog reset; power-on/brownout resets it to 1 */
+    uint32_t uptime_ms;                  /* since THIS boot, not cumulative */
+} ble_central_boot_info_t;
+
+void ble_central_get_boot_info(ble_central_boot_info_t *out);
+
+typedef struct {
+    uint32_t free_internal_heap;
+    uint32_t minimum_free_internal_heap;   /* lowest ever observed since this boot */
+    uint32_t largest_free_internal_block;
+    uint32_t notifications_received;       /* all characteristics, since this boot */
+    uint32_t notification_bytes_received;
+    uint32_t nimble_host_task_stack_highwater_words;  /* uxTaskGetStackHighWaterMark units */
+    bool     pending_operation_active;
+    uint32_t state_transition_total;
+} ble_central_health_t;
+
+void ble_central_get_health(ble_central_health_t *out);
+
 #ifdef __cplusplus
 }
 #endif

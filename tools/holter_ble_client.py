@@ -17,10 +17,15 @@ class ControllerError(Exception):
     """Raised when the controller returns status:"error", or when a
     host-side timeout elapses waiting for a response."""
 
-    def __init__(self, error_code, detail=None, request=None):
+    def __init__(self, error_code, detail=None, request=None, response=None):
         self.error_code = error_code
         self.detail = detail
         self.request = request
+        # BLE-D4.0B Step 3: the full raw response, so a caller can read the
+        # structured diagnostic fields (central_state, conn_handle,
+        # pending_operation_type, etc.) a specific error code carries,
+        # not just the generic error_code/detail strings.
+        self.response = response
         super().__init__(f"{error_code}: {detail}" if detail else error_code)
 
 
@@ -29,7 +34,7 @@ class HolterBLEClient:
     automation protocol. Thread-safe for concurrent send/event-drain.
     """
 
-    def __init__(self, port, baud=115200, default_timeout=10.0, log_file=None):
+    def __init__(self, port, baud=115200, default_timeout=10.0, log_file=None, raw_capture_path=None):
         self._ser = serial.Serial(port, baud, timeout=0.2)
         self._default_timeout = default_timeout
         self._next_id = 1
@@ -38,6 +43,16 @@ class HolterBLEClient:
         self._events = queue.Queue()
         self._unmatched = queue.Queue()  # responses whose id matched no pending send() (e.g. id:null parse errors)
         self._log_file = log_file
+        # BLE-D4.0C Step 2: any line that is NOT valid JSON (ESP-IDF boot
+        # banner, a panic/backtrace, a watchdog dump, a brownout message)
+        # used to be silently discarded here. Now captured with both a
+        # wall-clock and a monotonic timestamp -- monotonic because a panic
+        # can happen mid-reboot when the wall clock is meaningless for
+        # ordering, and because it survives NTP/timezone weirdness.
+        self._raw_lines = queue.Queue()
+        self._raw_capture_file = None
+        if raw_capture_path is not None:
+            self._raw_capture_file = open(raw_capture_path, "a", encoding="utf-8", buffering=1)
         self._stop = False
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -51,6 +66,23 @@ class HolterBLEClient:
             self._ser.close()
         except Exception:
             pass
+        if self._raw_capture_file is not None:
+            try:
+                self._raw_capture_file.close()
+            except Exception:
+                pass
+
+    def drain_raw_lines(self):
+        """Returns all raw non-JSON lines received so far (boot banners,
+        panics, watchdog/brownout messages), each as
+        {"wall_time", "monotonic", "line"}, and clears the internal queue."""
+        out = []
+        while True:
+            try:
+                out.append(self._raw_lines.get_nowait())
+            except queue.Empty:
+                break
+        return out
 
     def __enter__(self):
         return self
@@ -80,9 +112,14 @@ class HolterBLEClient:
                 line = line.strip()
                 if not line:
                     continue
+                decoded_line = line.decode("utf-8", errors="replace")
                 try:
-                    obj = json.loads(line.decode("utf-8", errors="replace"))
+                    obj = json.loads(decoded_line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
+                    record = {"wall_time": time.time(), "monotonic": time.monotonic(), "line": decoded_line}
+                    self._raw_lines.put(record)
+                    if self._raw_capture_file is not None:
+                        self._raw_capture_file.write(json.dumps(record) + "\n")
                     continue
                 self._log("recv", obj)
                 if obj.get("type") == "response":
@@ -125,7 +162,8 @@ class HolterBLEClient:
                 self._pending.pop(req_id, None)
 
         if resp.get("status") != "ok":
-            raise ControllerError(resp.get("error", "UNKNOWN_ERROR"), resp.get("detail"), request=request)
+            raise ControllerError(resp.get("error", "UNKNOWN_ERROR"), resp.get("detail"),
+                                   request=request, response=resp)
         return resp
 
     def send_raw_line(self, text):

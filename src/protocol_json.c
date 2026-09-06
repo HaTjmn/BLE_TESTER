@@ -57,6 +57,11 @@ void protocol_json_send_ok(int64_t id, cJSON *extra)
 
 void protocol_json_send_error(int64_t id, const char *error_code, const char *detail)
 {
+    protocol_json_send_error_ex(id, error_code, detail, NULL);
+}
+
+void protocol_json_send_error_ex(int64_t id, const char *error_code, const char *detail, cJSON *extra)
+{
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "response");
     cJSON_AddNumberToObject(root, "id", (double)id);
@@ -65,6 +70,7 @@ void protocol_json_send_error(int64_t id, const char *error_code, const char *de
     if (detail != NULL) {
         cJSON_AddStringToObject(root, "detail", detail);
     }
+    merge_and_free(root, extra);
     send_and_delete(root);
 }
 
