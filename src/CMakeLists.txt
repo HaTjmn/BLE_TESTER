@@ -7,6 +7,7 @@ idf_component_register(
         "command_dispatcher.c"
         "holterlev_client.c"
         "file_transfer_hash.c"
+        "file_integrity_diag.c"
 
     INCLUDE_DIRS
         "."

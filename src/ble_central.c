@@ -25,6 +25,7 @@
 
 #include "holterlev_protocol_ref.h"
 #include "file_transfer_hash.h"
+#include "file_integrity_diag.h"
 
 /* ---------------------------------------------------------------------
  * State
@@ -33,6 +34,12 @@
 static ble_central_state_t s_state = BLE_CENTRAL_STATE_IDLE;
 static uint8_t  s_own_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+/* BLE-D4.0F: distinct from s_pending's per-OPERATION generation -- this
+ * counts successful BLE CONNECTIONS (bumped once per BLE_GAP_EVENT_CONNECT
+ * success), so a diagnostic can tell "which connection attempt" a given
+ * received byte arrived over, across a reconnect. Protected by the same
+ * lock as s_conn_handle, since they always change together. */
+static uint32_t s_connection_generation = 0;
 static uint16_t s_mtu = 23;
 static char     s_peer_addr_str[18] = {0};
 static char     s_peer_name[32] = {0};
@@ -780,6 +787,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             portENTER_CRITICAL(&s_central_state_lock);
             s_conn_handle = event->connect.conn_handle;
+            s_connection_generation++;
             portEXIT_CRITICAL(&s_central_state_lock);
             s_connect_established_ms = now_ms();
             set_state(BLE_CENTRAL_STATE_CONNECTED, "gap_connected", 0);
@@ -857,6 +865,17 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
          * Python driver can still see phase/completion events. */
         bool is_file_transfer_data = (uuid_str != NULL) &&
             (strcasecmp(uuid_str, HLV_CHAR_FILE_TRANSFER_DATA_UUID) == 0);
+
+        /* BLE-D4.0F: unlike hash-only mode (below), this task needs
+         * Python to keep receiving the real notifications too -- it does
+         * its OWN independent absolute-offset reassembly, and the whole
+         * point is comparing the two independently, not substituting
+         * one for the other. So this runs ALONGSIDE normal forwarding,
+         * never instead of it. */
+        if (is_file_transfer_data && file_integrity_diag_is_active()) {
+            file_integrity_diag_ingest(buf, len, ble_central_connection_generation());
+        }
+
         if (is_file_transfer_data && file_transfer_hash_is_enabled()) {
             file_transfer_hash_ingest(buf, len);
         } else {
@@ -903,6 +922,7 @@ void ble_central_init(void)
 {
     record_boot();
     file_transfer_hash_init();
+    file_integrity_diag_init();
     memset(&s_pending, 0, sizeof(s_pending));
     nimble_port_init();
 
@@ -937,6 +957,15 @@ bool ble_central_is_connected(void) { return s_conn_handle != BLE_HS_CONN_HANDLE
 const char *ble_central_peer_addr_str(void) { return s_peer_addr_str; }
 const char *ble_central_peer_name(void) { return s_peer_name; }
 uint16_t ble_central_negotiated_mtu(void) { return s_mtu; }
+
+uint32_t ble_central_connection_generation(void)
+{
+    uint32_t gen;
+    portENTER_CRITICAL(&s_central_state_lock);
+    gen = s_connection_generation;
+    portEXIT_CRITICAL(&s_central_state_lock);
+    return gen;
+}
 
 uint16_t ble_central_find_char_val_handle(const char *char_uuid)
 {

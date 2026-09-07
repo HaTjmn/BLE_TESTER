@@ -5,6 +5,7 @@
 #include "holterlev_client.h"
 #include "holterlev_protocol_ref.h"
 #include "file_transfer_hash.h"
+#include "file_integrity_diag.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.3.1-diag"
+#define FIRMWARE_VERSION      "0.4.1-diag"
 
 /* BLE-D4.0E: diag_force_timeout deliberately manufactures a fake pending
  * operation -- flip this to 0 for any build that isn't this diagnostic
@@ -341,6 +342,7 @@ static void cmd_controller_status(int64_t id, cJSON *root)
         cJSON_AddStringToObject(j, "peer_name", ble_central_peer_name());
         cJSON_AddNumberToObject(j, "mtu", ble_central_negotiated_mtu());
     }
+    cJSON_AddNumberToObject(j, "connection_generation", ble_central_connection_generation());
     protocol_json_send_ok(id, j);
 }
 
@@ -547,6 +549,66 @@ static void cmd_diag_race_test_summary(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "completion_won", completion_won);
     cJSON_AddNumberToObject(j, "timeout_won", timeout_won);
     cJSON_AddNumberToObject(j, "neither_won", neither_won);
+    protocol_json_send_ok(id, j);
+}
+
+/* BLE-D4.0F: starts absolute-offset canonical reconstruction for a
+ * bounded diagnostic attempt. Does NOT suppress normal notification
+ * forwarding -- Python still receives every real notification and does
+ * its own independent reassembly, by design (the two must never share
+ * state). */
+static void cmd_diag_integrity_start(int64_t id, cJSON *root)
+{
+    uint32_t expected_size;
+    if (!require_uint32(id, root, "expected_size", &expected_size)) return;
+    if (!file_integrity_diag_start(expected_size)) {
+        protocol_json_send_error(id, "INVALID_ARGUMENT", "expected_size is zero or too large for the diagnostic buffer");
+        return;
+    }
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "active", file_integrity_diag_is_active());
+    cJSON_AddNumberToObject(j, "connection_generation", ble_central_connection_generation());
+    protocol_json_send_ok(id, j);
+}
+
+static void cmd_diag_integrity_stop(int64_t id, cJSON *root)
+{
+    (void)root;
+    file_integrity_diag_stop();
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "active", file_integrity_diag_is_active());
+    protocol_json_send_ok(id, j);
+}
+
+static void cmd_diag_integrity_summary(int64_t id, cJSON *root)
+{
+    (void)root;
+    file_integrity_diag_summary_t s;
+    file_integrity_diag_get_summary(&s);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddBoolToObject(j, "active", file_integrity_diag_is_active());
+    cJSON_AddNumberToObject(j, "expected_size", s.expected_size);
+    cJSON_AddNumberToObject(j, "notifications_received", s.notifications_received);
+    cJSON_AddNumberToObject(j, "unique_bytes_received", s.unique_bytes_received);
+    cJSON_AddNumberToObject(j, "identical_duplicate_bytes", s.identical_duplicate_bytes);
+    cJSON_AddNumberToObject(j, "conflicting_duplicate_bytes", s.conflicting_duplicate_bytes);
+    cJSON_AddNumberToObject(j, "out_of_range_chunks", s.out_of_range_chunks);
+    cJSON_AddBoolToObject(j, "complete", s.complete);
+    if (s.has_missing) cJSON_AddNumberToObject(j, "first_missing_offset", s.first_missing_offset);
+    if (s.has_conflict) {
+        cJSON *c = cJSON_CreateObject();
+        cJSON_AddNumberToObject(c, "offset", s.first_conflict.offset);
+        cJSON_AddNumberToObject(c, "old_byte", s.first_conflict.old_byte);
+        cJSON_AddNumberToObject(c, "new_byte", s.first_conflict.new_byte);
+        cJSON_AddNumberToObject(c, "old_generation", s.first_conflict.old_generation);
+        cJSON_AddNumberToObject(c, "new_generation", s.first_conflict.new_generation);
+        cJSON_AddItemToObject(j, "first_conflict", c);
+    }
+    if (s.complete) {
+        cJSON_AddNumberToObject(j, "crc32", s.crc32);
+        cJSON_AddStringToObject(j, "sha256", s.sha256_hex);
+    }
+    cJSON_AddNumberToObject(j, "connection_generation", ble_central_connection_generation());
     protocol_json_send_ok(id, j);
 }
 #endif /* BLE_TESTER_DIAG_COMMANDS_ENABLED */
@@ -913,6 +975,9 @@ void command_dispatcher_handle_line(char *line)
     else if (strcmp(cmd, "diag_force_timeout") == 0) cmd_diag_force_timeout(id, root);
     else if (strcmp(cmd, "diag_race_test") == 0) cmd_diag_race_test(id, root);
     else if (strcmp(cmd, "diag_race_test_summary") == 0) cmd_diag_race_test_summary(id, root);
+    else if (strcmp(cmd, "diag_integrity_start") == 0) cmd_diag_integrity_start(id, root);
+    else if (strcmp(cmd, "diag_integrity_stop") == 0) cmd_diag_integrity_stop(id, root);
+    else if (strcmp(cmd, "diag_integrity_summary") == 0) cmd_diag_integrity_summary(id, root);
 #endif
     else if (strcmp(cmd, "holter_connect") == 0) cmd_holter_connect(id, root);
     else if (strcmp(cmd, "holter_authenticate") == 0) cmd_holter_authenticate(id, root);

@@ -81,6 +81,11 @@ const char *ble_central_peer_addr_str(void);
 const char *ble_central_peer_name(void);
 uint16_t ble_central_negotiated_mtu(void);
 
+/* BLE-D4.0F: increments once per successful BLE connection (not per
+ * operation) -- lets a diagnostic attribute received data to "which
+ * connection attempt" it arrived over, across a reconnect. */
+uint32_t ble_central_connection_generation(void);
+
 /* Every *_start below returns false immediately (no dispatcher_on_*
  * callback will ever fire for this request_id) if another operation is
  * already pending or the current state does not permit it -- caller
