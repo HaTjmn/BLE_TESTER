@@ -7,7 +7,7 @@ extern "C" {
 
 void command_dispatcher_init(void);
 
-/* Registered with uart_command_server as its line handler. Takes
+/* Registered with protocol_transport as its line handler. Takes
  * ownership of `line` (frees it before returning). Never blocks for a
  * BLE operation to complete -- see ble_central.h's pending-op design. */
 void command_dispatcher_handle_line(char *line);

@@ -22,6 +22,7 @@
 #include "esp_system.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
 #include "holterlev_protocol_ref.h"
 #include "file_transfer_hash.h"
@@ -104,9 +105,9 @@ typedef struct {
 } pending_claim_t;
 
 /* BLE-D4.0E Step 2/3: the Timer Service Task must never build JSON or
- * touch UART. It posts a small, fixed-size event here instead; the UART
- * processor task (uart_command_server.c, 8192-byte stack) drains it and
- * does the actual protocol_json_send_error() work. Depth 8 is generous --
+ * touch UART. It posts a small, fixed-size event here instead; the
+ * protocol processor task (protocol_transport.c, 8192-byte stack) drains
+ * it and does the actual protocol_json_send_error() work. Depth 8 is generous --
  * only one operation is ever pending at a time by this codebase's own
  * design, so at most one timeout event is ever truly in flight; the
  * margin is for a burst of forced-timeout diagnostic testing. */
@@ -127,6 +128,35 @@ static uint32_t s_duplicate_completions_prevented = 0; /* the timer tried to cla
 static uint32_t s_race_completion_won = 0;
 static uint32_t s_race_timeout_won = 0;
 static uint32_t s_race_neither_won = 0; /* should never happen -- tracked as a correctness canary */
+
+/* BLE-D4.0G Step 3: the NimBLE host task's BLE_GAP_EVENT_NOTIFY_RX case
+ * must never build JSON, hash a payload, or touch a transport -- all of
+ * that used to run synchronously in the callback (confirmed by direct
+ * code audit in BLE-D4.0G Step 1). It now only classifies the handle,
+ * copies the payload into a fixed-size queue item, and returns. A
+ * dedicated worker task drains the queue and does the actual
+ * hex/cJSON/transport/hash/reassembly work on its own large stack.
+ * Depth 32 is a deliberate bound: a stall in the worker (e.g. a slow
+ * transport write) must show up as a queue-full/rejected count, never as
+ * unbounded memory growth or a silently truncated file transfer. */
+#define NOTIFY_QUEUE_DEPTH 32
+
+typedef struct {
+    uint16_t attr_handle;
+    bool     has_uuid;
+    char     uuid[BLE_CENTRAL_UUID_STR_LEN];
+    uint8_t  data[BLE_CENTRAL_MAX_READ_LEN];
+    uint16_t len;
+    bool     indication;
+    uint32_t connection_generation;
+} notify_queue_item_t;
+
+static QueueHandle_t s_notify_queue;
+static uint32_t s_notify_queue_full = 0;         /* xQueueSend failed -- notification rejected, not silently dropped-and-later-padded */
+static uint32_t s_notify_queue_highwater = 0;    /* max observed queue depth since boot */
+static uint32_t s_notify_worker_processed = 0;   /* worker task pulled and handled this many items */
+static uint32_t s_notify_records_forwarded = 0;  /* of those, this many actually reached command_dispatcher_on_notification (excludes hash-only-mode items) */
+static uint32_t s_notify_cb_max_duration_us = 0; /* worst-case time spent inside the NOTIFY_RX case itself */
 
 /* Atomically claims the currently-active pending operation for
  * termination -- succeeds for at most one caller per generation. Does
@@ -836,19 +866,24 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     }
 
     case BLE_GAP_EVENT_NOTIFY_RX: {
-        const char *uuid_str = NULL;
-        char uuid_buf[BLE_CENTRAL_UUID_STR_LEN];
+        int64_t cb_start_us = esp_timer_get_time();
+
+        notify_queue_item_t item;
+        item.has_uuid = false;
         for (int i = 0; i < s_chr_count; i++) {
             if (s_chrs[i].val_handle == event->notify_rx.attr_handle) {
-                strlcpy(uuid_buf, s_chrs[i].uuid, sizeof(uuid_buf));
-                uuid_str = uuid_buf;
+                strlcpy(item.uuid, s_chrs[i].uuid, sizeof(item.uuid));
+                item.has_uuid = true;
                 break;
             }
         }
         uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
         if (len > BLE_CENTRAL_MAX_READ_LEN) len = BLE_CENTRAL_MAX_READ_LEN;
-        uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
-        os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
+        item.attr_handle = event->notify_rx.attr_handle;
+        item.len = len;
+        os_mbuf_copydata(event->notify_rx.om, 0, len, item.data);
+        item.indication = event->notify_rx.indication;
+        item.connection_generation = ble_central_connection_generation();
 
         /* BLE-D4.0C Step 4: cheap counters only, no logging, updated here
          * and read back later from a safe task context (cmd_diag_health). */
@@ -857,30 +892,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         uint32_t free_now = (uint32_t)esp_get_free_heap_size();
         if (free_now < s_min_free_internal_heap_ever) s_min_free_internal_heap_ever = free_now;
 
-        /* BLE-D4.0C Step 6, Test A: while local-hash mode is enabled, a
-         * File Transfer Data notification is hashed locally INSTEAD of
-         * forwarded over UART -- this is what removes UART/Python from
-         * the data path. Every other characteristic (Command Response,
-         * Status, etc.) keeps forwarding normally regardless, so the
-         * Python driver can still see phase/completion events. */
-        bool is_file_transfer_data = (uuid_str != NULL) &&
-            (strcasecmp(uuid_str, HLV_CHAR_FILE_TRANSFER_DATA_UUID) == 0);
-
-        /* BLE-D4.0F: unlike hash-only mode (below), this task needs
-         * Python to keep receiving the real notifications too -- it does
-         * its OWN independent absolute-offset reassembly, and the whole
-         * point is comparing the two independently, not substituting
-         * one for the other. So this runs ALONGSIDE normal forwarding,
-         * never instead of it. */
-        if (is_file_transfer_data && file_integrity_diag_is_active()) {
-            file_integrity_diag_ingest(buf, len, ble_central_connection_generation());
+        /* BLE-D4.0G Step 3: everything that used to run right here --
+         * hex/cJSON encoding, the transport write, hash ingestion,
+         * absolute-offset reassembly -- now runs on notify_worker_task
+         * instead. This callback's only remaining jobs are classifying
+         * the handle, copying the payload, and handing it off. */
+        if (xQueueSend(s_notify_queue, &item, 0) != pdTRUE) {
+            s_notify_queue_full++;
+        } else {
+            UBaseType_t depth = uxQueueMessagesWaiting(s_notify_queue);
+            if (depth > s_notify_queue_highwater) s_notify_queue_highwater = depth;
         }
 
-        if (is_file_transfer_data && file_transfer_hash_is_enabled()) {
-            file_transfer_hash_ingest(buf, len);
-        } else {
-            command_dispatcher_on_notification(event->notify_rx.attr_handle, uuid_str, buf, len,
-                                                 event->notify_rx.indication);
+        int64_t duration_us = esp_timer_get_time() - cb_start_us;
+        if (duration_us > 0 && (uint32_t)duration_us > s_notify_cb_max_duration_us) {
+            s_notify_cb_max_duration_us = (uint32_t)duration_us;
         }
         return 0;
     }
@@ -918,6 +944,38 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+/* BLE-D4.0G Step 3: drains s_notify_queue on its own 8192-byte stack --
+ * everything the old inline BLE_GAP_EVENT_NOTIFY_RX handler used to do
+ * (hash ingestion, absolute-offset reassembly, hex/cJSON encoding, the
+ * transport write) now happens here instead of on the NimBLE host task. */
+static void notify_worker_task(void *arg)
+{
+    (void)arg;
+    notify_queue_item_t item;
+    while (true) {
+        if (xQueueReceive(s_notify_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        s_notify_worker_processed++;
+        const char *uuid_str = item.has_uuid ? item.uuid : NULL;
+
+        bool is_file_transfer_data = (uuid_str != NULL) &&
+            (strcasecmp(uuid_str, HLV_CHAR_FILE_TRANSFER_DATA_UUID) == 0);
+
+        if (is_file_transfer_data && file_integrity_diag_is_active()) {
+            file_integrity_diag_ingest(item.data, item.len, item.connection_generation);
+        }
+
+        if (is_file_transfer_data && file_transfer_hash_is_enabled()) {
+            file_transfer_hash_ingest(item.data, item.len);
+        } else {
+            command_dispatcher_on_notification(item.attr_handle, uuid_str, item.data, item.len,
+                                                 item.indication);
+            s_notify_records_forwarded++;
+        }
+    }
+}
+
 void ble_central_init(void)
 {
     record_boot();
@@ -944,6 +1002,9 @@ void ble_central_init(void)
 
     s_timeout_timer = xTimerCreate("op_timeout", pdMS_TO_TICKS(200), pdTRUE, NULL, timeout_timer_cb);
     xTimerStart(s_timeout_timer, 0);
+
+    s_notify_queue = xQueueCreate(NOTIFY_QUEUE_DEPTH, sizeof(notify_queue_item_t));
+    xTaskCreate(notify_worker_task, "notify_worker", 8192, NULL, 9, NULL);
 
     nimble_port_freertos_init(host_task);
 }
@@ -1354,10 +1415,17 @@ void ble_central_get_health(ble_central_health_t *out)
     out->timeout_events_processed = s_timeout_events_processed;
     out->late_completions_ignored = s_late_completions_ignored;
     out->duplicate_completions_prevented = s_duplicate_completions_prevented;
+
+    out->notify_queue_depth = s_notify_queue != NULL ? (uint32_t)uxQueueMessagesWaiting(s_notify_queue) : 0;
+    out->notify_queue_highwater = s_notify_queue_highwater;
+    out->notify_queue_full_events = s_notify_queue_full;
+    out->notify_worker_processed = s_notify_worker_processed;
+    out->notify_records_forwarded = s_notify_records_forwarded;
+    out->notify_callback_max_duration_us = s_notify_cb_max_duration_us;
 }
 
-/* BLE-D4.0E Step (drain): runs on the UART processor task (large stack),
- * called from uart_command_server's poll hook every ~20ms. Pops every
+/* BLE-D4.0E Step (drain): runs on the protocol processor task (large stack),
+ * called from protocol_transport's poll hook every ~20ms. Pops every
  * currently-queued event -- from either timer -- and turns it into the
  * matching response on this task's own stack, never the Timer Service
  * Task's. A real timeout produces the same TIMEOUT response

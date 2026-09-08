@@ -1,5 +1,5 @@
 #include "command_dispatcher.h"
-#include "uart_command_server.h"
+#include "protocol_transport.h"
 #include "protocol_json.h"
 #include "ble_central.h"
 #include "holterlev_client.h"
@@ -15,7 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.4.1-diag"
+#define FIRMWARE_VERSION      "0.5.0-diag"
 
 /* BLE-D4.0E: diag_force_timeout deliberately manufactures a fake pending
  * operation -- flip this to 0 for any build that isn't this diagnostic
@@ -450,6 +450,12 @@ static void cmd_diag_health(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "timeout_events_processed", h.timeout_events_processed);
     cJSON_AddNumberToObject(j, "late_completions_ignored", h.late_completions_ignored);
     cJSON_AddNumberToObject(j, "duplicate_completions_prevented", h.duplicate_completions_prevented);
+    cJSON_AddNumberToObject(j, "notify_queue_depth", h.notify_queue_depth);
+    cJSON_AddNumberToObject(j, "notify_queue_highwater", h.notify_queue_highwater);
+    cJSON_AddNumberToObject(j, "notify_queue_full_events", h.notify_queue_full_events);
+    cJSON_AddNumberToObject(j, "notify_worker_processed", h.notify_worker_processed);
+    cJSON_AddNumberToObject(j, "notify_records_forwarded", h.notify_records_forwarded);
+    cJSON_AddNumberToObject(j, "notify_callback_max_duration_us", h.notify_callback_max_duration_us);
     protocol_json_send_ok(id, j);
 }
 
@@ -919,7 +925,7 @@ void command_dispatcher_init(void)
     s_event_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(mirrored_event_t));
     ble_central_init();
     holterlev_client_init();
-    uart_command_server_init(command_dispatcher_handle_line, ble_central_drain_timeout_events);
+    protocol_transport_init(command_dispatcher_handle_line, ble_central_drain_timeout_events);
 }
 
 void command_dispatcher_handle_line(char *line)

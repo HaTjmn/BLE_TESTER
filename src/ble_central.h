@@ -230,6 +230,14 @@ typedef struct {
     uint32_t timeout_events_processed;             /* UART processor task drained and responded to */
     uint32_t late_completions_ignored;             /* a real GATT/GAP completion arrived after its op was already claimed (timed out/cancelled) */
     uint32_t duplicate_completions_prevented;      /* the timer's claim attempt lost the race to a completion that claimed first */
+
+    /* BLE-D4.0G Step 3 -- notification callback -> worker queue. */
+    uint32_t notify_queue_depth;                   /* items currently queued, sampled at read time */
+    uint32_t notify_queue_highwater;                /* max observed queue depth since boot */
+    uint32_t notify_queue_full_events;              /* callback's xQueueSend failed -- notification rejected, never silently dropped-and-padded */
+    uint32_t notify_worker_processed;               /* worker task pulled and handled this many items since boot */
+    uint32_t notify_records_forwarded;              /* of those, reached command_dispatcher_on_notification (excludes hash-only-mode items) */
+    uint32_t notify_callback_max_duration_us;        /* worst-case time spent inside BLE_GAP_EVENT_NOTIFY_RX itself */
 } ble_central_health_t;
 
 void ble_central_get_health(ble_central_health_t *out);

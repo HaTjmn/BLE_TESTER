@@ -1,44 +1,39 @@
-#include "uart_command_server.h"
+#include "protocol_transport.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-#include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#define UART_PORT           UART_NUM_0
-#define UART_BAUD_RATE      115200
-#define UART_RX_BUF_SIZE    2048
-#define UART_TX_BUF_SIZE    2048
-#define MAX_LINE_LEN        4096
-#define LINE_QUEUE_DEPTH    8
+/* Worst case one line: a File Transfer Data notification, 512 hex-encoded
+ * payload bytes (1024 chars) plus JSON envelope overhead -- comfortably
+ * under MAX_LINE_LEN. Sized well above the peripheral's own 256-byte
+ * default so a single line rarely spans more than one TX FIFO drain
+ * cycle at USB Full Speed. */
+#define USB_TX_BUF_SIZE      4096
+#define USB_RX_BUF_SIZE      4096
+#define MAX_LINE_LEN         4096
+#define LINE_QUEUE_DEPTH     8
+#define POLL_INTERVAL_MS     20
 
 static SemaphoreHandle_t s_tx_mutex;
 static QueueHandle_t     s_line_queue;
-static uart_command_line_handler_t s_handler;
-static uart_command_poll_fn_t s_poll_fn;
+static protocol_transport_line_handler_t s_handler;
+static protocol_transport_poll_fn_t s_poll_fn;
 
-/* BLE-D4.0E: how long processor_task can go without checking s_poll_fn
- * when no UART line has arrived. Bounds the extra latency between the
- * Timer Service Task detecting a timeout and this task turning it into
- * an actual UART response -- small next to the 200ms op-timeout period
- * itself, and nothing here blocks either task in the meantime. */
-#define POLL_INTERVAL_MS 20
-
-void uart_command_server_send_line(const char *line)
+void protocol_transport_send_line(const char *line)
 {
     if (line == NULL) {
         return;
     }
     size_t len = strlen(line);
-    /* +1 for '\n'; written in a single locked section so a response and
-     * an event from another task never interleave mid-line. */
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
-    uart_write_bytes(UART_PORT, line, len);
-    uart_write_bytes(UART_PORT, "\n", 1);
+    usb_serial_jtag_write_bytes(line, len, portMAX_DELAY);
+    usb_serial_jtag_write_bytes("\n", 1, portMAX_DELAY);
     xSemaphoreGive(s_tx_mutex);
 }
 
@@ -50,7 +45,7 @@ static void rx_task(void *arg)
     uint8_t byte;
 
     while (true) {
-        int n = uart_read_bytes(UART_PORT, &byte, 1, pdMS_TO_TICKS(100));
+        int n = usb_serial_jtag_read_bytes(&byte, 1, pdMS_TO_TICKS(100));
         if (n <= 0) {
             continue;
         }
@@ -97,25 +92,20 @@ static void processor_task(void *arg)
     }
 }
 
-void uart_command_server_init(uart_command_line_handler_t handler, uart_command_poll_fn_t poll_fn)
+void protocol_transport_init(protocol_transport_line_handler_t handler, protocol_transport_poll_fn_t poll_fn)
 {
     s_handler = handler;
     s_poll_fn = poll_fn;
 
-    uart_config_t cfg = {
-        .baud_rate = UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    usb_serial_jtag_driver_config_t cfg = {
+        .tx_buffer_size = USB_TX_BUF_SIZE,
+        .rx_buffer_size = USB_RX_BUF_SIZE,
     };
-    uart_driver_install(UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
-    uart_param_config(UART_PORT, &cfg);
+    usb_serial_jtag_driver_install(&cfg);
 
     s_tx_mutex = xSemaphoreCreateMutex();
     s_line_queue = xQueueCreate(LINE_QUEUE_DEPTH, sizeof(char *));
 
-    xTaskCreate(rx_task, "uart_rx", 4096, NULL, 10, NULL);
-    xTaskCreate(processor_task, "uart_cmd", 8192, NULL, 9, NULL);
+    xTaskCreate(rx_task, "usb_rx", 4096, NULL, 10, NULL);
+    xTaskCreate(processor_task, "usb_cmd", 8192, NULL, 9, NULL);
 }

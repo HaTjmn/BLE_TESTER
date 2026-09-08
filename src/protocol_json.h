@@ -12,8 +12,8 @@ extern "C" {
 /*
  * NDJSON framing for the UART automation protocol: one complete JSON
  * object per line. All send functions are safe to call from any task
- * (NimBLE host task included) -- the actual UART write is serialized by
- * uart_command_server so a response and an unsolicited event can never
+ * (NimBLE host task included) -- the actual write is serialized by
+ * protocol_transport so a response and an unsolicited event can never
  * interleave into one corrupted line.
  */
 

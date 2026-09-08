@@ -1,5 +1,5 @@
 #include "protocol_json.h"
-#include "uart_command_server.h"
+#include "protocol_transport.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -23,7 +23,7 @@ static void send_and_delete(cJSON *root)
     if (text == NULL) {
         return;
     }
-    uart_command_server_send_line(text);
+    protocol_transport_send_line(text);
     cJSON_free(text);
 }
 
