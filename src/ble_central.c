@@ -283,6 +283,14 @@ static const char *reset_reason_name(esp_reset_reason_t r)
         case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
         case ESP_RST_BROWNOUT:  return "BROWNOUT";
         case ESP_RST_SDIO:      return "SDIO";
+        /* BLE-D4.0G Step 5: observed on hardware -- opening a fresh raw
+         * host-side handle against the native USB-Serial/JTAG port (this
+         * board's second, dedicated protocol channel) resets the chip via
+         * its own USB peripheral, distinct from UART0/CH340's
+         * USB_UART_CHIP_RESET. Confirmed against esp_system.h, not
+         * guessed; harmless (host-connection-triggered, not a crash). */
+        case ESP_RST_USB:       return "USB_PERIPHERAL_RESET";
+        case ESP_RST_JTAG:      return "JTAG";
         default:                return NULL;
     }
 }
