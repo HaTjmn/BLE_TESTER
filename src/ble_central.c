@@ -974,13 +974,22 @@ static void notify_worker_task(void *arg)
             file_integrity_diag_ingest(item.data, item.len, item.connection_generation);
         }
 
+        /* BLE-D4.0I Phase 4: file_transfer_hash used to REPLACE forwarding
+         * for File Transfer Data notifications (BLE-D4.0C Test A's
+         * original, deliberate design -- remove UART/Python from the
+         * data path entirely, to isolate whether BLE reception alone
+         * crashed BLE_TESTER). This task's own spec requires the
+         * opposite for the streaming architecture Python now owns:
+         * "forward every valid protocol chunk to Python regardless of
+         * whether the streaming hash remains valid." Hashing is now
+         * purely additive, matching file_integrity_diag's existing
+         * alongside-forwarding pattern -- never a substitute for it. */
         if (is_file_transfer_data && file_transfer_hash_is_enabled()) {
             file_transfer_hash_ingest(item.data, item.len);
-        } else {
-            command_dispatcher_on_notification(item.attr_handle, uuid_str, item.data, item.len,
-                                                 item.indication);
-            s_notify_records_forwarded++;
         }
+        command_dispatcher_on_notification(item.attr_handle, uuid_str, item.data, item.len,
+                                             item.indication);
+        s_notify_records_forwarded++;
     }
 }
 

@@ -15,7 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.5.2-diag"
+#define FIRMWARE_VERSION      "0.5.3-diag"
 
 /* BLE-D4.0E: diag_force_timeout deliberately manufactures a fake pending
  * operation -- flip this to 0 for any build that isn't this diagnostic
