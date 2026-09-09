@@ -14,6 +14,7 @@ static bool     s_enabled = false;
 static bool     s_have_transfer_id = false;
 static uint16_t s_transfer_id = 0;
 static uint32_t s_expected_offset = 0;
+static bool     s_canonical_valid = false;
 
 static uint32_t s_notifications = 0;
 static uint32_t s_bytes = 0;
@@ -25,6 +26,7 @@ static uint32_t s_first_gap_offset = 0;
 static uint32_t s_gap_count = 0;
 static uint32_t s_duplicate_count = 0;
 static uint32_t s_out_of_order_count = 0;
+static uint32_t s_reconnect_count = 0;
 
 static uint32_t s_crc32 = 0xFFFFFFFFU;
 static mbedtls_sha256_context s_sha_ctx;
@@ -77,6 +79,8 @@ void file_transfer_hash_enable(bool enable)
         s_gap_count = 0;
         s_duplicate_count = 0;
         s_out_of_order_count = 0;
+        s_reconnect_count = 0;
+        s_canonical_valid = true;
         s_crc32 = 0xFFFFFFFFU;
 
         mbedtls_sha256_free(&s_sha_ctx);
@@ -115,27 +119,52 @@ void file_transfer_hash_ingest(const uint8_t *data, size_t len)
         s_first_offset = chunk_offset;
     }
 
+    /* BLE-D4.0I Phase 4: this codebase's own resume convention issues a
+     * new transfer_id when a download continues after a reconnect -- that
+     * is NOT itself a break in canonical byte order (the file is still
+     * the same logical file, picking up where it left off). Track the
+     * change for visibility only; the offset check below is the ONLY
+     * thing allowed to gate hashing or invalidate the digest, so a
+     * reconnect that resumes exactly at next_expected_offset must not
+     * stop the hash. */
     if (!s_have_transfer_id) {
         s_have_transfer_id = true;
         s_transfer_id = transfer_id;
     } else if (transfer_id != s_transfer_id) {
+        s_transfer_id = transfer_id;
         s_out_of_order_count++;
+        s_reconnect_count++;
+    }
+
+    if (!s_canonical_valid) {
+        /* Order was already broken earlier in this attempt -- a streaming
+         * hash can never recover a lost position, so every subsequent
+         * chunk (even a perfectly in-order one from here on) is still
+         * counted for observability but never hashed again. */
+        if (chunk_offset < s_expected_offset) s_duplicate_count++;
+        else if (chunk_offset > s_expected_offset) s_gap_count++;
         return;
     }
 
-    if (chunk_offset < s_expected_offset) {
-        s_duplicate_count++;
-        return;
-    }
-    if (chunk_offset > s_expected_offset) {
-        s_gap_count++;
-        if (!s_has_gap) {
-            s_has_gap = true;
-            s_first_gap_offset = chunk_offset;
+    if (chunk_offset != s_expected_offset) {
+        /* Strictly BEFORE or AFTER next_expected_offset -- either way the
+         * digest can no longer represent "the file by position" from a
+         * pure streaming pass, so it is marked invalid HERE, permanently,
+         * rather than either silently skipping (which could hide a lost
+         * tail-of-chunk on a partial overlap) or silently hashing anyway
+         * (the bug this replaces: a forward gap used to be hashed as if
+         * contiguous, corrupting the digest without any signal). */
+        if (chunk_offset < s_expected_offset) {
+            s_duplicate_count++;
+        } else {
+            s_gap_count++;
+            if (!s_has_gap) {
+                s_has_gap = true;
+                s_first_gap_offset = chunk_offset;
+            }
         }
-        /* Diagnostic mode: keep observing forward rather than stalling the
-         * whole session on one gap -- Test A cares about whether BLE_TESTER
-         * survives sustained reception, not about producing a valid file. */
+        s_canonical_valid = false;
+        return;
     }
 
     const uint8_t *fragment = data + CHUNK_HEADER_LEN;
@@ -154,6 +183,7 @@ void file_transfer_hash_get_summary(file_transfer_hash_summary_t *out)
     out->boot_generation_end = b.boot_generation;
     out->notifications_received = s_notifications;
     out->bytes_received = s_bytes;
+    out->next_expected_offset = s_expected_offset;
     out->first_offset = s_first_offset;
     out->has_first_offset = s_has_first_offset;
     out->last_offset = s_last_offset;
@@ -162,6 +192,8 @@ void file_transfer_hash_get_summary(file_transfer_hash_summary_t *out)
     out->gap_count = s_gap_count;
     out->duplicate_count = s_duplicate_count;
     out->out_of_order_count = s_out_of_order_count;
+    out->reconnect_count = s_reconnect_count;
+    out->canonical_valid = s_canonical_valid;
     out->crc32 = s_crc32 ^ 0xFFFFFFFFU;
 
     /* mbedtls_sha256_context on this target may wrap a hardware SHA engine

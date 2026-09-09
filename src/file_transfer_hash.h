@@ -41,15 +41,28 @@ typedef struct {
     uint32_t boot_generation_start;
     uint32_t boot_generation_end;
     uint32_t notifications_received;
-    uint32_t bytes_received;
+    uint32_t bytes_received;        /* == hashed_byte_count: only bytes actually folded into crc32/sha256 */
+    uint32_t next_expected_offset;  /* BLE-D4.0I Phase 4: the one offset that would still extend the canonical digest */
     uint32_t first_offset;
     bool     has_first_offset;
     uint32_t last_offset;
     uint32_t first_gap_offset;
     bool     has_gap;
     uint32_t gap_count;
-    uint32_t duplicate_count;
-    uint32_t out_of_order_count;   /* chunk from a different transfer_id than the one first locked in */
+    uint32_t duplicate_count;       /* any chunk whose offset != next_expected_offset, whether behind or ahead */
+    uint32_t out_of_order_count;    /* chunk from a different transfer_id than the one first locked in (informational only -- see canonical_valid) */
+    uint32_t reconnect_count;       /* transfer_id changes observed -- a resume convention, not itself a break in order */
+    /* BLE-D4.0I Phase 4: true only if every accepted chunk since
+     * file_transfer_hash_enable() satisfied chunk_offset ==
+     * next_expected_offset, with no exception -- i.e. crc32/sha256_hex
+     * represent the file's true canonical byte sequence from offset 0.
+     * Once false, stays false for the rest of this attempt (a lost
+     * position can never be un-lost by a streaming-only hash). A caller
+     * MUST check this before treating crc32/sha256_hex as the file's
+     * real digest -- they are still computed and returned when false,
+     * but they cover only whatever prefix/fragments were actually
+     * hashed before/around the break, not the whole file. */
+    bool     canonical_valid;
     uint32_t crc32;
     char     sha256_hex[65];
     uint32_t elapsed_ms;

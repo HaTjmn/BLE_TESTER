@@ -15,7 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
-#define FIRMWARE_VERSION      "0.5.1-diag"
+#define FIRMWARE_VERSION      "0.5.2-diag"
 
 /* BLE-D4.0E: diag_force_timeout deliberately manufactures a fake pending
  * operation -- flip this to 0 for any build that isn't this diagnostic
@@ -481,12 +481,17 @@ static void cmd_diag_file_hash_summary(int64_t id, cJSON *root)
     cJSON_AddNumberToObject(j, "boot_generation_end", s.boot_generation_end);
     cJSON_AddNumberToObject(j, "notifications_received", s.notifications_received);
     cJSON_AddNumberToObject(j, "bytes_received", s.bytes_received);
+    cJSON_AddNumberToObject(j, "next_expected_offset", s.next_expected_offset);
     if (s.has_first_offset) cJSON_AddNumberToObject(j, "first_offset", s.first_offset);
     cJSON_AddNumberToObject(j, "last_offset", s.last_offset);
     if (s.has_gap) cJSON_AddNumberToObject(j, "first_gap_offset", s.first_gap_offset);
     cJSON_AddNumberToObject(j, "gap_count", s.gap_count);
     cJSON_AddNumberToObject(j, "duplicate_count", s.duplicate_count);
     cJSON_AddNumberToObject(j, "out_of_order_count", s.out_of_order_count);
+    cJSON_AddNumberToObject(j, "reconnect_count", s.reconnect_count);
+    /* BLE-D4.0I Phase 4: callers MUST check this before treating crc32/
+     * sha256 as the file's real digest -- see file_transfer_hash.h. */
+    cJSON_AddBoolToObject(j, "valid", s.canonical_valid);
     cJSON_AddNumberToObject(j, "crc32", s.crc32);
     cJSON_AddStringToObject(j, "sha256", s.sha256_hex);
     cJSON_AddNumberToObject(j, "elapsed_ms", s.elapsed_ms);
