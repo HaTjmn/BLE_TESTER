@@ -29,6 +29,39 @@ class ControllerError(Exception):
         super().__init__(f"{error_code}: {detail}" if detail else error_code)
 
 
+class NdjsonLineFramer:
+    """BLE-D4.0I Phase 6: reassembles newline-delimited lines from
+    arbitrary byte chunks and classifies each as parsed JSON or a raw
+    (non-JSON / malformed) line. Pure logic, no I/O -- extracted from
+    HolterBLEClient._read_loop() so the split-across-reads and
+    multiple-messages-per-read cases can be unit-tested without a real
+    or mocked serial port. Behavior is unchanged from the inline version
+    this replaces: an internal buffer persists across feed() calls, and
+    every complete line found in one feed() is returned, in order."""
+
+    def __init__(self):
+        self._buf = b""
+
+    def feed(self, chunk):
+        """Returns a list of ("json", obj) / ("raw", decoded_line) tuples
+        for every complete line now available -- zero, one, or many."""
+        self._buf += chunk
+        results = []
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            decoded_line = line.decode("utf-8", errors="replace")
+            try:
+                obj = json.loads(decoded_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                results.append(("raw", decoded_line))
+                continue
+            results.append(("json", obj))
+        return results
+
+
 class HolterBLEClient:
     """Opens one serial port and speaks the newline-delimited JSON
     automation protocol. Thread-safe for concurrent send/event-drain.
@@ -98,7 +131,7 @@ class HolterBLEClient:
         self._log_file.flush()
 
     def _read_loop(self):
-        buf = b""
+        framer = NdjsonLineFramer()
         while not self._stop:
             try:
                 chunk = self._ser.read(4096)
@@ -106,21 +139,14 @@ class HolterBLEClient:
                 break
             if not chunk:
                 continue
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                decoded_line = line.decode("utf-8", errors="replace")
-                try:
-                    obj = json.loads(decoded_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    record = {"wall_time": time.time(), "monotonic": time.monotonic(), "line": decoded_line}
+            for kind, payload in framer.feed(chunk):
+                if kind == "raw":
+                    record = {"wall_time": time.time(), "monotonic": time.monotonic(), "line": payload}
                     self._raw_lines.put(record)
                     if self._raw_capture_file is not None:
                         self._raw_capture_file.write(json.dumps(record) + "\n")
                     continue
+                obj = payload
                 self._log("recv", obj)
                 if obj.get("type") == "response":
                     rid = obj.get("id")
