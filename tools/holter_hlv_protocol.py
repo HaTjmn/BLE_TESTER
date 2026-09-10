@@ -30,14 +30,35 @@ HLV_OPCODE_LIST_FILES = 0x0020
 HLV_OPCODE_GET_FILE_INFO = 0x0021
 HLV_OPCODE_START_FILE_DOWNLOAD = 0x0022
 HLV_OPCODE_ABORT_FILE_DOWNLOAD = 0x0023
+# BLE-D4.0J (docs/ble/PROTOCOL.md Section 18) -- two-phase delete-all-recordings.
+HLV_OPCODE_PREPARE_DELETE_ALL_FILES = 0x0024
+HLV_OPCODE_CONFIRM_DELETE_ALL_FILES = 0x0025
+HLV_OPCODE_GET_DELETE_STATUS = 0x0026
 
 HLV_RESULT_OK = 0
 HLV_RESULT_UNAUTHORIZED = 2
 HLV_RESULT_INVALID_STATE = 3
 HLV_RESULT_INVALID_ARGUMENT = 4
+HLV_RESULT_SD_NOT_READY = 5
+HLV_RESULT_BUSY = 9
 HLV_RESULT_TRANSACTION_CONFLICT = 13
 HLV_RESULT_FILE_NOT_FOUND = 14
 HLV_RESULT_TRANSFER_BUSY = 15
+HLV_RESULT_TOKEN_INVALID = 16
+HLV_RESULT_INVENTORY_MISMATCH = 17
+
+HLV_DELETE_STATE_IDLE = 0
+HLV_DELETE_STATE_PREPARED = 1
+HLV_DELETE_STATE_DELETING = 2
+HLV_DELETE_STATE_COMPLETE = 3
+HLV_DELETE_STATE_FAILED = 4
+HLV_DELETE_STATE_NAMES = {
+    HLV_DELETE_STATE_IDLE: "IDLE",
+    HLV_DELETE_STATE_PREPARED: "PREPARED",
+    HLV_DELETE_STATE_DELETING: "DELETING",
+    HLV_DELETE_STATE_COMPLETE: "COMPLETE",
+    HLV_DELETE_STATE_FAILED: "FAILED",
+}
 
 HLV_SESSION_RECORDING = 3
 
@@ -116,6 +137,61 @@ def decode_get_file_info_response(inner):
     exists = bool(inner[0])
     size_bytes = inner[1] | (inner[2] << 8) | (inner[3] << 16) | (inner[4] << 24)
     return {"exists": exists, "size_bytes": size_bytes}
+
+
+def decode_prepare_delete_all_files_response(inner):
+    """Mirrors PROTOCOL.md Section 18.1's PREPARE_DELETE_ALL_FILES response
+    shape (21 bytes): token(8) + file_count(4) + total_bytes(4) +
+    expires_in_ms(4) + operation_type(1)."""
+    token = bytes(inner[0:8])
+    file_count = inner[8] | (inner[9] << 8) | (inner[10] << 16) | (inner[11] << 24)
+    total_bytes = inner[12] | (inner[13] << 8) | (inner[14] << 16) | (inner[15] << 24)
+    expires_in_ms = inner[16] | (inner[17] << 8) | (inner[18] << 16) | (inner[19] << 24)
+    operation_type = inner[20]
+    return {
+        "token": token,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "expires_in_ms": expires_in_ms,
+        "operation_type": operation_type,
+    }
+
+
+def encode_confirm_delete_all_files_request(token, expected_file_count, expected_total_bytes):
+    """Mirrors PROTOCOL.md Section 18.1's CONFIRM_DELETE_ALL_FILES request
+    shape (16 bytes): token(8) + expected_file_count(4) + expected_total_bytes(4)."""
+    if len(token) != 8:
+        raise ValueError(f"token must be exactly 8 bytes, got {len(token)}")
+    return (
+        bytes(token)
+        + expected_file_count.to_bytes(4, "little")
+        + expected_total_bytes.to_bytes(4, "little")
+    )
+
+
+def decode_get_delete_status_response(inner):
+    """Mirrors PROTOCOL.md Section 18.1's GET_DELETE_STATUS response shape
+    (56 bytes)."""
+    state = inner[0]
+    files_planned = inner[1] | (inner[2] << 8) | (inner[3] << 16) | (inner[4] << 24)
+    bytes_planned = inner[5] | (inner[6] << 8) | (inner[7] << 16) | (inner[8] << 24)
+    files_deleted = inner[9] | (inner[10] << 8) | (inner[11] << 16) | (inner[12] << 24)
+    bytes_deleted = inner[13] | (inner[14] << 8) | (inner[15] << 16) | (inner[16] << 24)
+    failures = inner[17] | (inner[18] << 8) | (inner[19] << 16) | (inner[20] << 24)
+    first_error_code = inner[21] | (inner[22] << 8)
+    first_failed_path_len = inner[23]
+    first_failed_path_bytes = bytes(inner[24:24 + first_failed_path_len])
+    return {
+        "state": state,
+        "state_name": HLV_DELETE_STATE_NAMES.get(state, f"UNKNOWN_{state}"),
+        "files_planned": files_planned,
+        "bytes_planned": bytes_planned,
+        "files_deleted": files_deleted,
+        "bytes_deleted": bytes_deleted,
+        "failures": failures,
+        "first_error_code": first_error_code,
+        "first_failed_path": first_failed_path_bytes.decode("utf-8", errors="replace"),
+    }
 
 
 def decode_file_chunk_header(data_hex):
