@@ -34,6 +34,10 @@ HLV_OPCODE_ABORT_FILE_DOWNLOAD = 0x0023
 HLV_OPCODE_PREPARE_DELETE_ALL_FILES = 0x0024
 HLV_OPCODE_CONFIRM_DELETE_ALL_FILES = 0x0025
 HLV_OPCODE_GET_DELETE_STATUS = 0x0026
+# BLE-D4.0K -- diagnostic-only, compile-gated fallback (HOLTER_DIAG_TEST_FILE_GEN_ENABLED).
+# Empirically required after the preferred UART0 console path proved unreachable on this
+# hardware (write() to the console's COM port consistently timed out).
+HLV_OPCODE_DIAG_GENERATE_TEST_FILE = 0x0027
 
 HLV_RESULT_OK = 0
 HLV_RESULT_UNAUTHORIZED = 2
@@ -191,6 +195,32 @@ def decode_get_delete_status_response(inner):
         "failures": failures,
         "first_error_code": first_error_code,
         "first_failed_path": first_failed_path_bytes.decode("utf-8", errors="replace"),
+    }
+
+
+def encode_diag_generate_test_file_request(record_count, frames_per_record):
+    """BLE-D4.0K: mirrors HOLTER_BLE_DIAG_GENERATE_TEST_FILE_REQUEST_LEN (3
+    bytes): record_count(1) + frames_per_record(2)."""
+    return bytes([record_count & 0xFF]) + frames_per_record.to_bytes(2, "little")
+
+
+def decode_diag_generate_test_file_response(inner):
+    """BLE-D4.0K: mirrors the 43-byte DIAG_GENERATE_TEST_FILE response:
+    error(1) + records_written(4) + bytes_written(4) + is_valid(1) +
+    sha256_valid(1) + sha256(32)."""
+    error = inner[0]
+    records_written = inner[1] | (inner[2] << 8) | (inner[3] << 16) | (inner[4] << 24)
+    bytes_written = inner[5] | (inner[6] << 8) | (inner[7] << 16) | (inner[8] << 24)
+    is_valid = bool(inner[9])
+    sha256_valid = bool(inner[10])
+    sha256 = bytes(inner[11:11 + 32])
+    return {
+        "error": error,
+        "records_written": records_written,
+        "bytes_written": bytes_written,
+        "is_valid": is_valid,
+        "sha256_valid": sha256_valid,
+        "sha256_hex": sha256.hex(),
     }
 
 

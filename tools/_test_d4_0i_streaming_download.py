@@ -102,9 +102,20 @@ def main():
     health0 = client.send("diag_health", timeout=5)
     log(f"boot_generation_before={boot0['boot_generation']} free_heap_before={health0['free_internal_heap']}")
 
-    diag_start_resp = client.send("diag_integrity_start", timeout=5, expected_size=expected_size)
-    full_file_diag_enabled = diag_start_resp.get("active", False)
-    full_file_diag_skip_reason = None if full_file_diag_enabled else "expected_size_exceeds_limit"
+    # BLE-D4.0K: file_integrity_diag.c's nominal 256KB cap suggests this file (well under
+    # that) should fit, but its 4-bytes-per-source-byte design (buf + received + 2-byte
+    # gen_at_offset) can still fail against this chip's actual largest-contiguous-free-block
+    # ceiling (observed ~160KB even at a fresh boot) well below the nominal cap. Per this
+    # task's own Phase 10 wording ("enable file_integrity_diag.c IF the live size is within
+    # its SAFE supported limit"), a rejection here is treated as informational, not fatal --
+    # the streaming hash + Python reconstruction remain the primary evidence sources either way.
+    try:
+        diag_start_resp = client.send("diag_integrity_start", timeout=5, expected_size=expected_size)
+        full_file_diag_enabled = diag_start_resp.get("active", False)
+        full_file_diag_skip_reason = None if full_file_diag_enabled else "rejected_by_device"
+    except ControllerError as e:
+        full_file_diag_enabled = False
+        full_file_diag_skip_reason = f"allocation_failed_despite_nominal_cap: {e}"
     log(f"full_file_diag_enabled={full_file_diag_enabled} "
         f"full_file_diag_skip_reason={full_file_diag_skip_reason}")
 
