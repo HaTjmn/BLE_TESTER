@@ -1,0 +1,41 @@
+# BLE Test Controller -- NimBLE central/GATT-client role only.
+#
+# Same delta HolterLEV's own firmware uses to enable NimBLE
+# (sdkconfig.esp32-s3-devkitc-1-n32r8v-ble-dev in that repo): NimBLE, not
+# Bluedroid, BLE-only controller mode. ESP-IDF's default NimBLE Kconfig
+# already enables CONFIG_BT_NIMBLE_ROLE_CENTRAL and
+# CONFIG_BT_NIMBLE_GATT_CLIENT, so no further role configuration is
+# needed for a central-only application.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+
+# UART0 is the sole host-automation channel (NDJSON in/out) -- boot log
+# and app log output must never share it, or a log line could corrupt a
+# JSON response line the host is trying to parse. Silencing both here is
+# simpler and more robust than a prefix-filtering scheme.
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Physically confirmed via `esptool.py --port COM28 flash_id` before any
+# flashing: 16MB flash on this test-controller board.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# BLE-D4.0D Step 4 -- diagnosing a captured StoreProhibited panic inside
+# FreeRTOS's own Timer Service Task (uxListRemove). The default
+# CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY only checks at a context
+# switch, by which point the corrupting write may be long gone; the
+# watchpoint method traps the instant any of a task's last 32 stack bytes
+# are written, giving a precise, immediate signal instead of an inference.
+# GCC's own stack-protector catches local-buffer overruns the watchpoint
+# wouldn't (an overrun contained within one stack frame, not reaching the
+# very end of the whole task stack). Verified against this project's own
+# installed Kconfig (kconfig_menus.json) before adding, not guessed.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y

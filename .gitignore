@@ -1,0 +1,16 @@
+.pio/
+build/
+sdkconfig.*
+!sdkconfig.defaults
+*.log
+tools/logs/
+test/host/logs/
+__pycache__/
+*.pyc
+
+# BLE-D4.0C diagnostic evidence -- downloaded/reconstructed files, raw
+# baseline captures, and raw serial/crash logs are test evidence, not
+# source code.
+downloads/
+tools/_baseline_run_*.bin
+tools/_evidence/
