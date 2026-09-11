@@ -53,12 +53,23 @@ under it unless you have a reason to put evidence elsewhere.
 
 ### Authentication
 
-The device access code is resolved in this order: `--auth-code` >
-`$HOLTER_DEV_ACCESS_CODE` environment variable > this project's own
-existing default dev code. **Never pass a real secret on the command
-line in a shared/logged shell** — prefer the environment variable. The
-resolved code is never printed, logged, or written to any evidence file
-under any circumstance.
+The device access code is resolved with this precedence, and **this
+tool never silently falls back to a hardcoded development code**:
+
+1. `--auth-code` — supported for backward compatibility, but **least
+   secure**: visible in shell history, process listings, and CI job
+   command lines. Avoid it in shared/logged environments.
+2. `$HOLTER_AUTH_CODE` environment variable — **recommended for
+   automation/CI**.
+3. Interactive `getpass` prompt (input hidden), offered only when
+   stdin is a real TTY — **recommended for manual use**.
+4. If none of the above is available in a non-interactive environment,
+   the tool fails cleanly before opening any serial port.
+
+The resolved code is never printed, logged, or written to any evidence
+file, exception message, or traceback under any circumstance — it is
+held in a wrapper whose own `str()`/`repr()` always render as
+`<redacted>`.
 
 ## Argument reference
 

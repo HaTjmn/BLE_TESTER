@@ -213,9 +213,13 @@ class _CliTestCase(unittest.TestCase):
         return exit_code, fake_client, console_port
 
     def default_argv(self, **overrides):
+        # --auth-code defaults to a harmless placeholder so every test not
+        # specifically about auth-code resolution (BLE-D4.0V) doesn't have
+        # to deal with the interactive/env-var precedence chain at all.
         argv = {
             "--tester-port": "COM17", "--console-port": "COM23",
             "--records": "7", "--output-dir": self.output_dir,
+            "--auth-code": "test-placeholder-not-a-real-secret",
         }
         argv.update(overrides)
         out = []
@@ -717,6 +721,140 @@ class TestReplayD4_0S(_CliTestCase):
         with open(os.path.join(self.output_dir, "events.jsonl")) as f:
             transitions = [json.loads(l)["phase"] for l in f if '"phase_transition"' in l]
         self.assertEqual(transitions, ["WRITING", "POST_WRITE_VALIDATION", "COMPLETED"])
+
+
+def _env_without_auth_var():
+    """A mock.patch.dict context that guarantees HOLTER_AUTH_CODE is
+    absent, regardless of the real host environment, without the
+    self-recursive trap of mocking os.environ.get() from inside a
+    module that itself calls os.environ.get()."""
+    env = dict(os.environ)
+    env.pop(cli.AUTH_CODE_ENV_VAR, None)
+    return mock.patch.dict(os.environ, env, clear=True)
+
+
+# =====================================================================
+# BLE-D4.0V: secure authentication-input path
+# =====================================================================
+class TestAuthCliValuePrecedence(_CliTestCase):
+    def test_cli_value_wins_over_env_var(self):
+        with mock.patch.dict(os.environ, {cli.AUTH_CODE_ENV_VAR: "env-value"}):
+            code, source = cli.resolve_auth_code(
+                cli.parse_args(self.default_argv(**{"--auth-code": "cli-value"}))
+            )
+        self.assertEqual(code.reveal(), b"cli-value")
+        self.assertEqual(source, "cli_argument")
+
+
+class TestAuthEnvVarFallback(_CliTestCase):
+    def test_env_var_used_when_no_cli_value(self):
+        argv = [a for a in self.default_argv() if a not in ("--auth-code", "test-placeholder-not-a-real-secret")]
+        with mock.patch.dict(os.environ, {cli.AUTH_CODE_ENV_VAR: "env-value"}):
+            code, source = cli.resolve_auth_code(cli.parse_args(argv))
+        self.assertEqual(code.reveal(), b"env-value")
+        self.assertEqual(source, "environment_variable")
+
+
+class TestAuthInteractiveFallback(_CliTestCase):
+    def test_getpass_used_when_tty_and_no_other_source(self):
+        argv = [a for a in self.default_argv() if a not in ("--auth-code", "test-placeholder-not-a-real-secret")]
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             _env_without_auth_var(), \
+             mock.patch("sys.stdin.isatty", return_value=True), \
+             mock.patch("getpass.getpass", return_value="typed-secret") as gp:
+            code, source = cli.resolve_auth_code(cli.parse_args(argv))
+        self.assertEqual(code.reveal(), b"typed-secret")
+        self.assertEqual(source, "interactive_getpass")
+        gp.assert_called_once()
+
+
+class TestAuthNonInteractiveMissingSecretFails(_CliTestCase):
+    def test_no_source_available_non_interactively_fails_cleanly_before_any_port(self):
+        argv = [a for a in self.default_argv() if a not in ("--auth-code", "test-placeholder-not-a-real-secret")]
+        with _env_without_auth_var(), \
+             mock.patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaises(cli.CliError) as cm:
+                cli.resolve_auth_code(cli.parse_args(argv))
+        self.assertEqual(cm.exception.exit_code, cli.EXIT_INVALID_ARGS)
+        self.assertIn("hardcoded", str(cm.exception).lower())
+
+    def test_full_cli_fails_before_opening_any_port(self):
+        argv = [a for a in self.default_argv() if a not in ("--auth-code", "test-placeholder-not-a-real-secret")]
+
+        class _ExplodingSerialModule:
+            def Serial(self, *a, **k):
+                raise AssertionError("must never open the console port when no auth code is available")
+
+        def exploding_client(*a, **k):
+            raise AssertionError("must never open the tester port when no auth code is available")
+
+        with _env_without_auth_var(), \
+             mock.patch("sys.stdin.isatty", return_value=False), \
+             mock.patch.object(cli, "HolterBLEClient", exploding_client), \
+             mock.patch.dict(sys.modules, {"serial": _ExplodingSerialModule()}), \
+             mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            exit_code = cli.main(argv)
+        self.assertEqual(exit_code, cli.EXIT_INVALID_ARGS)
+
+
+class TestAuthRedactionEverywhere(_CliTestCase):
+    def _run_with_secret(self, secret_value):
+        records, size = 7, compute_expected_tliv_bytes(7)
+        scripted = _ScriptedWait(
+            accepted=_accepted_response(),
+            list_queue=[_list_response([]), _list_response([{"file_index": 1, "size_bytes": size}]),
+                        _info_response(True, size)],
+            runner_queue=[_terminal_success(records, size)],
+        )
+        return self.run_cli(
+            self.default_argv(**{"--auth-code": secret_value}),
+            console_chunks=[f"SD_WRITER_SUMMARY session=x, open=1, attempted={records}, written={records}, bytes={size}\n".encode()],
+            patches=[mock.patch.object(cli, "wait_for_command_response", scripted)],
+        )
+
+    def test_secret_absent_from_every_evidence_file(self):
+        secret = "MY-VERY-SECRET-CODE-42"
+        exit_code, fake_client, _ = self._run_with_secret(secret)
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        for fname in ("run_manifest.json", "result.json", "events.jsonl",
+                      "pre_generation_inventory.json", "post_generation_inventory.json"):
+            path = os.path.join(self.output_dir, fname)
+            with open(path, "rb") as f:
+                content = f.read()
+            self.assertNotIn(secret.encode(), content, f"secret leaked into {fname}")
+        with open(os.path.join(self.output_dir, "console_raw.log"), "rb") as f:
+            self.assertNotIn(secret.encode(), f.read())
+        with open(os.path.join(self.output_dir, "tester_raw.jsonl"), "rb") as f:
+            self.assertNotIn(secret.encode(), f.read())
+        with open(os.path.join(self.output_dir, "run_manifest.json")) as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["auth_code_source"], "cli_argument")
+
+    def test_secret_absent_from_exception_message_and_traceback(self):
+        secret = "MY-OTHER-SECRET-99"
+
+        def raising_wait(client, txn, window_s):
+            raise ValueError("boom while auth_code is in scope")
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            exit_code, fake_client, _ = self.run_cli(
+                self.default_argv(**{"--auth-code": secret}),
+                patches=[mock.patch.object(cli, "wait_for_command_response", raising_wait)],
+            )
+        self.assertEqual(exit_code, cli.EXIT_UNEXPECTED_TOOL_FAILURE)
+        self.assertNotIn(secret, err.getvalue())
+        with open(os.path.join(self.output_dir, "run_manifest.json")) as f:
+            manifest_text = f.read()
+        self.assertNotIn(secret, manifest_text)
+
+    def test_secret_repr_and_str_are_always_redacted(self):
+        s = cli.Secret(b"a-real-secret-value")
+        self.assertEqual(repr(s), "<redacted>")
+        self.assertEqual(str(s), "<redacted>")
+        self.assertEqual(f"{s}", "<redacted>")
+        self.assertEqual(s.reveal(), b"a-real-secret-value")
 
 
 if __name__ == "__main__":

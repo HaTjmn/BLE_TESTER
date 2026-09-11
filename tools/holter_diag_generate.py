@@ -49,7 +49,7 @@ from holter_ble_client import HolterBLEClient, ControllerError  # noqa: E402
 from holter_hlv_protocol import (  # noqa: E402
     HLV_DEVICE_NAME, HLV_CONTROL_POINT_UUID, HLV_COMMAND_RESPONSE_UUID, HLV_STATUS_UUID,
     HLV_OPCODE_LIST_FILES, HLV_OPCODE_GET_FILE_INFO, HLV_OPCODE_DIAG_GENERATE_TEST_FILE,
-    HLV_RESPONSE_PHASE_ACCEPTED, HLV_DEV_ACCESS_CODE, HLV_DIAG_TEST_FILE_MAX_RECORDS,
+    HLV_RESPONSE_PHASE_ACCEPTED, HLV_DIAG_TEST_FILE_MAX_RECORDS,
     encode_hlv_message, decode_status_bytes, decode_list_files_response, decode_get_file_info_response,
     decode_diag_generate_test_file_response, encode_diag_generate_test_file_request_v2,
     wait_for_command_response, authenticate_raw,
@@ -131,8 +131,11 @@ def parse_args(argv=None):
     p.add_argument("--frames-per-record", type=int, default=DEFAULT_FRAMES_PER_RECORD,
                    help="device-side sanity value only; does not change actual per-record frame count")
     p.add_argument("--auth-code", default=None,
-                   help="override the device auth code (default: $HOLTER_DEV_ACCESS_CODE env var, "
-                        "else this project's own default dev code). NEVER logged or written to evidence.")
+                   help="device auth code -- supported for backward compatibility, but LESS SECURE "
+                        "(visible in shell history/process listings). Prefer $HOLTER_AUTH_CODE for "
+                        "automation, or omit both and answer the interactive prompt for manual use. "
+                        "NEVER logged or written to evidence; this tool never falls back to a "
+                        "hardcoded development code.")
     p.add_argument("--host-timeout", type=float, default=15.0, help="host-side wire-level wait ceiling, seconds")
 
     p.add_argument("--acceptance-timeout", type=float, default=DEFAULT_ACCEPTANCE_TIMEOUT_S,
@@ -186,16 +189,68 @@ def sanitize_args_for_evidence(args):
     return d
 
 
+class Secret:
+    """BLE-D4.0V: wraps a resolved auth-code so an accidental str()/repr()/
+    f-string interpolation anywhere (a log line, an exception message, a
+    debugger, a future code change) can never reveal the value. Only
+    .reveal() returns the real bytes -- exactly one call site (the
+    authenticate_raw() call in connect_and_prepare()) is permitted to
+    use it."""
+    __slots__ = ("_value",)
+
+    def __init__(self, value: bytes):
+        self._value = value
+
+    def reveal(self) -> bytes:
+        return self._value
+
+    def __repr__(self):
+        return "<redacted>"
+
+    __str__ = __repr__
+
+
+AUTH_CODE_ENV_VAR = "HOLTER_AUTH_CODE"
+
+
 def resolve_auth_code(args):
-    """Precedence: --auth-code > $HOLTER_DEV_ACCESS_CODE > this project's
-    own existing default (HLV_DEV_ACCESS_CODE). Never returned in any
-    form suitable for logging -- callers must not print this value."""
+    """BLE-D4.0V: safer auth-code precedence, replacing BLE-D4.0U's
+    silent hardcoded-development-code fallback (removed -- this tool
+    must never fall back to HLV_DEV_ACCESS_CODE on its own):
+
+      1. --auth-code       (backward compatible, but least secure --
+                             visible in shell history/process listings)
+      2. $HOLTER_AUTH_CODE (recommended for automation/CI)
+      3. interactive getpass, only when stdin is a real TTY
+                            (recommended for manual/interactive use)
+      4. clean failure -- never a silent fallback
+
+    Returns (Secret, source_name) where source_name is safe,
+    non-secret metadata ("cli_argument"/"environment_variable"/
+    "interactive_getpass") suitable for the manifest. Raises CliError
+    (EXIT_INVALID_ARGS) before any port is opened if nothing is
+    available non-interactively.
+    """
     if args.auth_code:
-        return args.auth_code.encode("utf-8")
-    env = os.environ.get("HOLTER_DEV_ACCESS_CODE")
+        return Secret(args.auth_code.encode("utf-8")), "cli_argument"
+
+    env = os.environ.get(AUTH_CODE_ENV_VAR)
     if env:
-        return env.encode("utf-8")
-    return HLV_DEV_ACCESS_CODE
+        return Secret(env.encode("utf-8")), "environment_variable"
+
+    if sys.stdin.isatty():
+        import getpass
+        code = getpass.getpass("HolterLEV device auth code (input hidden): ")
+        if code:
+            return Secret(code.encode("utf-8")), "interactive_getpass"
+
+    raise CliError(
+        EXIT_INVALID_ARGS,
+        f"no auth code available: pass --auth-code, set ${AUTH_CODE_ENV_VAR} "
+        f"(recommended for automation), or run this tool interactively so it can "
+        f"prompt securely (recommended for manual use). This tool never falls back "
+        f"to a hardcoded development access code.",
+    )
 
 
 class Manifest:
@@ -362,7 +417,7 @@ def connect_and_prepare(client, args, manifest, auth_code):
         raise CliError(EXIT_BLE_PREFLIGHT_FAILURE, f"connect/discover/subscribe failed: {e}")
 
     base_txn = int(time.time() * 1000) & 0x7FFFFFFF
-    status = authenticate_raw(client, base_txn, code=auth_code)
+    status = authenticate_raw(client, base_txn, code=auth_code.reveal())
     manifest.data["ble_authentications"] += 1
     manifest._flush()
     if not status["authorized"]:
@@ -392,6 +447,12 @@ def preflight_status_check(client, manifest):
 def run(args, manifest):
     expected_bytes = compute_expected_tliv_bytes(args.records)
     manifest.update(expected_bytes=expected_bytes)
+
+    # Resolved BEFORE any port is opened: a non-interactive environment
+    # with no credential available fails immediately, with no port-open
+    # (and no consequent device-reset risk) ever attempted.
+    auth_code, auth_code_source = resolve_auth_code(args)
+    manifest.update(auth_code_source=auth_code_source)
 
     # ---- open both required ports, exactly once each ----
     try:
@@ -424,7 +485,6 @@ def run(args, manifest):
     manifest.data["serial_ports_opened"] += 1
     manifest._flush()
 
-    auth_code = resolve_auth_code(args)
     try:
         try:
             base_txn = connect_and_prepare(client, args, manifest, auth_code)
