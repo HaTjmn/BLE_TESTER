@@ -78,6 +78,47 @@ POST_WRITE_TIMEOUT_MAX_S = 60 * 60      # 1 hour hard cap, regardless of file si
 DEFAULT_MAX_TOTAL_DURATION_S = 90 * 60
 
 
+def compute_expected_tliv_bytes(record_count: int) -> int:
+    """BLE-D4.0U -- the ONE authoritative host-side formula for this
+    diagnostic generator's own deterministic TLIV file size, given a
+    record count. Callers (the CLI, its tests, and this module's own
+    tests) must call this rather than re-deriving the formula.
+
+    Mirrors the real generator's fixed 3-channel/[534,533,533]-frame
+    cycling pattern (holter_diag_test_file_generator.c) and the
+    168 + 12*frame_count per-record formula derived from
+    HOLTER_TLIV_HEADER_SIZE_BYTES/HOLTER_TLIV_ECG_DATA_HEADER_SIZE_BYTES
+    -- cross-validated byte-for-byte against four independent hardware
+    reference points: 7->45,984 (BLE-D4.0K), 144->945,792 (BLE-D4.0M),
+    1,873->12,301,872 (BLE-D4.0Q), 18,667->122,604,864 (BLE-D4.0S).
+
+    This relationship is NOT automatically kept in sync with the
+    firmware: if HOLTER_TLIV_HEADER_SIZE_BYTES,
+    HOLTER_TLIV_ECG_DATA_HEADER_SIZE_BYTES, or this generator's own
+    fixed phase pattern ever changes on the firmware side, this
+    function's own reference points above must be re-derived and
+    re-validated against a fresh hardware measurement -- it is a
+    mirrored constant, not a live query of the device.
+
+    Overflow-safe: Python integers are arbitrary-precision, and every
+    intermediate value here stays far below any fixed-width limit even
+    at the protocol's own 65,535-record wire ceiling (~431MB) -- this is
+    still validated defensively (a non-positive record_count raises)
+    rather than trusted blindly.
+    """
+    if record_count <= 0:
+        raise ValueError(f"record_count must be positive, got {record_count}")
+
+    per_record_bytes_phase0 = 168 + 12 * 534
+    per_record_bytes_other = 168 + 12 * 533
+
+    full_cycles, remainder = divmod(record_count, 3)
+    total = full_cycles * (per_record_bytes_phase0 + 2 * per_record_bytes_other)
+    for i in range(remainder):
+        total += per_record_bytes_phase0 if i == 0 else per_record_bytes_other
+    return total
+
+
 def compute_post_write_validation_timeout_s(
     expected_bytes: int,
     bytes_per_sec: int = CONSERVATIVE_VALIDATION_BYTES_PER_SEC,
@@ -379,9 +420,11 @@ class GenerationMonitorStateMachine:
 
 
 # =============================================================================
-# Thin I/O wiring layer -- NOT unit-tested directly (no fake clock/serial
-# double exists for this class; GenerationMonitorStateMachine above carries
-# the entire tested contract). Kept deliberately small on purpose, mirroring
+# Thin I/O wiring layer -- exercised in tests only via injected fakes (a
+# fake port double, a fake now_fn, fake wait/decode callables); it holds
+# no phase-decision logic of its own for those tests to duplicate.
+# GenerationMonitorStateMachine above carries the entire tested DECISION
+# contract. Kept deliberately small on purpose, mirroring
 # file_reconstructor.py's own FileReconstructor/FileDownloadSession split.
 # =============================================================================
 class GenerationRunner:
@@ -408,12 +451,19 @@ class GenerationRunner:
         self._console = None
 
     def run(self, sm: GenerationMonitorStateMachine, client, gen_txn: int,
-             wait_for_command_response, decode_response, now_fn=time.time):
+             wait_for_command_response, decode_response, now_fn=time.time, on_tick=None):
         """Runs sm to a terminal phase. `wait_for_command_response` and
         `decode_response` are injected exactly like the console opener --
         this keeps GenerationRunner a pure wiring shim with no import-time
         dependency on holter_hlv_protocol's own decode functions, so a
-        protocol change never requires touching this class."""
+        protocol change never requires touching this class.
+
+        `on_tick`, if given, is called once per poll iteration (and once
+        more after the final terminal transition) with the current
+        GenerationEvidence -- a pure OBSERVATION hook for a caller's own
+        live progress display or event log, never a decision point: it
+        cannot influence phase transitions, and this loop's own control
+        flow is identical whether or not one is supplied."""
         import re
 
         sd_writer_pattern = re.compile(
@@ -443,8 +493,15 @@ class GenerationRunner:
                         m = sd_writer_pattern.search(text)
                         if m:
                             sm.on_progress(now_fn(), int(m.group(1)), int(m.group(2)))
+                            if on_tick is not None:
+                                on_tick(sm.evidence(now_fn()))
+                            if sm.is_terminal():
+                                break
                 else:
                     sm.on_serial_read_timeout(now_fn())
+
+                if sm.is_terminal():
+                    break
 
                 terminal = wait_for_command_response(client, gen_txn, window_s=0.5)
                 if terminal is not None:
@@ -460,10 +517,17 @@ class GenerationRunner:
                             sha256_valid=result["sha256_valid"],
                             sha256_hex=result["sha256_hex"],
                         )
+                    if on_tick is not None:
+                        on_tick(sm.evidence(now_fn()))
+                elif on_tick is not None:
+                    on_tick(sm.evidence(now_fn()))
         finally:
             try:
                 self._console.close()
             finally:
                 sm.serial_ports_closed += 1
 
-        return sm.evidence(now_fn())
+        final_evidence = sm.evidence(now_fn())
+        if on_tick is not None:
+            on_tick(final_evidence)
+        return final_evidence

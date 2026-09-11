@@ -19,6 +19,7 @@ from diag_generation_monitor import (
     GenerationMonitorStateMachine,
     GenerationMonitorError,
     compute_post_write_validation_timeout_s,
+    compute_expected_tliv_bytes,
     POST_WRITE_TIMEOUT_MIN_S,
     POST_WRITE_TIMEOUT_MAX_S,
     CONSERVATIVE_VALIDATION_BYTES_PER_SEC,
@@ -490,6 +491,30 @@ class Test28OverflowSafeTimeoutAtMaximumSize(unittest.TestCase):
         self.assertLessEqual(timeout, POST_WRITE_TIMEOUT_MAX_S)
         # Documents the actual safety margin this policy gives the real BLE-D4.0S file.
         self.assertGreater(timeout / 580.5, 2.5, "expected roughly 3x margin over the real measured duration")
+
+
+# ---- BLE-D4.0U: the one authoritative expected-size formula --------------
+class Test30ExpectedByteFormula(unittest.TestCase):
+    def test_all_four_known_hardware_reference_points(self):
+        self.assertEqual(compute_expected_tliv_bytes(7), 45984)
+        self.assertEqual(compute_expected_tliv_bytes(144), 945792)
+        self.assertEqual(compute_expected_tliv_bytes(1873), 12301872)
+        self.assertEqual(compute_expected_tliv_bytes(18667), 122604864)
+
+    def test_non_positive_record_count_raises(self):
+        with self.assertRaises(ValueError):
+            compute_expected_tliv_bytes(0)
+        with self.assertRaises(ValueError):
+            compute_expected_tliv_bytes(-1)
+
+    def test_max_wire_ceiling_does_not_raise_or_overflow(self):
+        # 65535 records -- this protocol's own uint16_t record_count wire
+        # ceiling -- must compute cleanly with no overflow (Python ints
+        # are arbitrary-precision, but the function is still expected to
+        # behave sanely, not merely "not crash").
+        total = compute_expected_tliv_bytes(65535)
+        self.assertGreater(total, 0)
+        self.assertIsInstance(total, int)
 
 
 # ---- Replay of preserved BLE-D4.0S evidence -----------------------------

@@ -200,8 +200,30 @@ def decode_get_delete_status_response(inner):
 
 def encode_diag_generate_test_file_request(record_count, frames_per_record):
     """BLE-D4.0K: mirrors HOLTER_BLE_DIAG_GENERATE_TEST_FILE_REQUEST_LEN (3
-    bytes): record_count(1) + frames_per_record(2)."""
+    bytes): record_count(1) + frames_per_record(2). Legacy shape -- caps
+    record_count at 255; use encode_diag_generate_test_file_request_v2()
+    for anything larger."""
     return bytes([record_count & 0xFF]) + frames_per_record.to_bytes(2, "little")
+
+
+# BLE-D4.0Q introduced this SECOND, wider request length (4 bytes,
+# uint16_t record_count) for the SAME opcode, dispatched purely by
+# payload length on the firmware side (holter_ble_protocol.c) -- the
+# legacy 3-byte shape above still decodes exactly as before, unchanged.
+# Promoted here in BLE-D4.0U: this had existed only as byte-identical
+# duplicated logic inline in two separate untracked scratch scripts
+# (BLE-D4.0Q's and BLE-D4.0S's own generation scripts) -- this is now
+# the ONE tracked, shared implementation every caller must use.
+HLV_DIAG_TEST_FILE_MAX_RECORDS = 20000  # mirrors HOLTER_DIAG_TEST_FILE_MAX_RECORDS as of BLE-D4.0S/1.6.10
+
+
+def encode_diag_generate_test_file_request_v2(record_count, frames_per_record):
+    """BLE-D4.0Q: the extended 4-byte request -- record_count:u16 LE +
+    frames_per_record:u16 LE. Permits record_count up to this protocol's
+    own uint16_t wire ceiling (65535); the firmware's own diagnostic-only
+    HLV_DIAG_TEST_FILE_MAX_RECORDS cap (currently 20000, see that
+    constant above) is enforced device-side, not by this encoder."""
+    return record_count.to_bytes(2, "little") + frames_per_record.to_bytes(2, "little")
 
 
 def decode_diag_generate_test_file_response(inner):
