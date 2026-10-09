@@ -28,7 +28,12 @@ GOLDEN_LIST_INNER = bytes.fromhex("1e001c49")
 GOLDEN_STATUS_SNAPSHOT = bytes.fromhex(
     "010204010000300061d805010203020000000300000004000000020301000b000000030000000200"
     "0000e0930400ec910400c0a8010a09000000")
-GOLDEN_CAPS_INNER = bytes.fromhex("01050f05")
+GOLDEN_CAPS_INNER = bytes.fromhex("02050f05")   # protocol v2 (HLV-WIFI-20261009-013)
+# HLV-WIFI-20261009-013: the firmware codec's own answers -- (opcode, auth, encrypted, policy, result) for
+# holter_ble_wifi_admit() with a well-formed request per opcode, and (auth, current, encrypted, policy,
+# att) for holter_ble_wifi_snapshot_access().
+GOLDEN_ADMISSION = [(0x30,0,0,0,2),(0x30,0,0,1,2),(0x30,0,1,0,2),(0x30,0,1,1,2),(0x30,1,0,0,0),(0x30,1,0,1,0),(0x30,1,1,0,0),(0x30,1,1,1,0),(0x31,0,0,0,2),(0x31,0,0,1,2),(0x31,0,1,0,2),(0x31,0,1,1,2),(0x31,1,0,0,0),(0x31,1,0,1,18),(0x31,1,1,0,0),(0x31,1,1,1,0),(0x32,0,0,0,2),(0x32,0,0,1,2),(0x32,0,1,0,2),(0x32,0,1,1,2),(0x32,1,0,0,0),(0x32,1,0,1,18),(0x32,1,1,0,0),(0x32,1,1,1,0),(0x33,0,0,0,2),(0x33,0,0,1,2),(0x33,0,1,0,2),(0x33,0,1,1,2),(0x33,1,0,0,0),(0x33,1,0,1,18),(0x33,1,1,0,0),(0x33,1,1,1,0),(0x34,0,0,0,2),(0x34,0,0,1,2),(0x34,0,1,0,2),(0x34,0,1,1,2),(0x34,1,0,0,0),(0x34,1,0,1,18),(0x34,1,1,0,0),(0x34,1,1,1,0),(0x35,0,0,0,2),(0x35,0,0,1,2),(0x35,0,1,0,2),(0x35,0,1,1,2),(0x35,1,0,0,0),(0x35,1,0,1,18),(0x35,1,1,0,0),(0x35,1,1,1,0),(0x36,0,0,0,2),(0x36,0,0,1,2),(0x36,0,1,0,2),(0x36,0,1,1,2),(0x36,1,0,0,0),(0x36,1,0,1,18),(0x36,1,1,0,0),(0x36,1,1,1,0),(0x37,0,0,0,2),(0x37,0,0,1,2),(0x37,0,1,0,2),(0x37,0,1,1,2),(0x37,1,0,0,0),(0x37,1,0,1,18),(0x37,1,1,0,0),(0x37,1,1,1,0),(0x38,0,0,0,2),(0x38,0,0,1,2),(0x38,0,1,0,2),(0x38,0,1,1,2),(0x38,1,0,0,0),(0x38,1,0,1,18),(0x38,1,1,0,0),(0x38,1,1,1,0),(0x39,0,0,0,2),(0x39,0,0,1,2),(0x39,0,1,0,2),(0x39,0,1,1,2),(0x39,1,0,0,0),(0x39,1,0,1,18),(0x39,1,1,0,0),(0x39,1,1,1,0)]
+GOLDEN_SNAPSHOT_ACCESS = [(0,0,0,0,8),(0,0,0,1,15),(0,0,1,0,8),(0,0,1,1,8),(0,1,0,0,8),(0,1,0,1,15),(0,1,1,0,8),(0,1,1,1,8),(1,0,0,0,8),(1,0,0,1,15),(1,0,1,0,8),(1,0,1,1,8),(1,1,0,0,0),(1,1,0,1,15),(1,1,1,0,0),(1,1,1,1,0)]
 GOLDEN_ADD_OK_INNER = bytes.fromhex("01000000")
 GOLDEN_ADD_FULL_INNER = bytes.fromhex("05020000")
 # docs/ble/PROTOCOL.md 19.9 (admitted as OK by the firmware codec)
@@ -77,8 +82,9 @@ class CodecTests(unittest.TestCase):
 
     def test_capabilities_golden(self):
         caps = w.decode_capabilities(GOLDEN_CAPS_INNER)
-        self.assertEqual((caps["version"], caps["max_networks"], caps["auth_mask"]), (1, 5, 0x0F))
-        self.assertTrue(caps["cred_requires_encryption"] and caps["snapshot_char"])
+        self.assertEqual((caps["version"], caps["max_networks"], caps["auth_mask"]), (w.WIFI_BLE_VERSION, 5, 0x0F))
+        self.assertEqual(w.WIFI_BLE_VERSION, 2)
+        self.assertTrue(caps["requires_encryption"] and caps["snapshot_char"])
         self.assertFalse(caps["cred_encrypted_at_rest"])
 
     def test_completed_inner_golden(self):
@@ -117,6 +123,28 @@ class CodecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             w.decode_snapshot(GOLDEN_LIST_SNAPSHOT, expect_ref=(30, 0))
         self.assertEqual(w.decode_snapshot(bytes([1, 0, 0, 0, 0, 0, 0, 0, 0, 0])), {"kind": "none"})
+
+
+class PolicyTests(unittest.TestCase):
+    """HLV-WIFI-20261009-013 (F2): the client's policy mirror equals the firmware codec, cell for cell."""
+
+    def test_admission_matrix_matches_firmware(self):
+        self.assertEqual(len(GOLDEN_ADMISSION), 80)
+        for op, auth, enc, pol, fw in GOLDEN_ADMISSION:
+            expect = w.expected_admission(0x0000 | op, bool(auth), bool(enc), bool(pol))
+            self.assertEqual(fw, 0 if expect is None else expect, (hex(op), auth, enc, pol))
+
+    def test_only_capabilities_is_exempt(self):
+        exempt = {op for op in range(0x30, 0x3A) if not w.requires_encrypted_link(op)}
+        self.assertEqual(exempt, {w.HLV_OPCODE_WIFI_GET_CAPABILITIES})
+        self.assertFalse(any(w.requires_encrypted_link(op, policy_on=False) for op in range(0x30, 0x3A)))
+
+    def test_snapshot_access_matches_firmware(self):
+        self.assertEqual(len(GOLDEN_SNAPSHOT_ACCESS), 16)
+        for auth, cur, enc, pol, fw in GOLDEN_SNAPSHOT_ACCESS:
+            expect = w.expected_snapshot_att_error(bool(auth), bool(cur), bool(enc), bool(pol))
+            self.assertEqual(fw, 0 if expect is None else expect, (auth, cur, enc, pol))
+        self.assertEqual((w.ATT_INSUFFICIENT_ENCRYPTION, w.ATT_INSUFFICIENT_AUTHORIZATION), (0x0F, 0x08))
 
 
 class FakeSerial:
@@ -165,6 +193,19 @@ class RedactionTests(unittest.TestCase):
 
 
 class ManageToolTests(unittest.TestCase):
+    def test_snapshot_att_error_is_reported(self):
+        client = mock.Mock()
+        client.send.side_effect = holter_ble_client.ControllerError(
+            "READ_FAILED", "GATT read error", response={"status": "error", "gatt_status": 0x10F, "att_error": 0x0F})
+        self.assertEqual(cli.WifiSession(client).snapshot_att_error(), 0x0F)
+        client.send.side_effect = None
+        client.send.return_value = {"status": "ok", "data_hex": "01000000000000000000"}
+        self.assertIsNone(cli.WifiSession(client).snapshot_att_error())
+
+    def test_plaintext_matrix_covers_every_opcode(self):
+        ops = [op for op, _ in cli.plaintext_matrix_requests()]
+        self.assertEqual(sorted(ops), list(range(0x30, 0x3A)))
+
     def test_send_raw_marks_credential_writes_sensitive(self):
         client = mock.Mock()
         s = cli.WifiSession(client)

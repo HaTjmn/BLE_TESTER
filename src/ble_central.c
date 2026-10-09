@@ -673,7 +673,7 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     set_state(BLE_CENTRAL_STATE_READY, "read_done", (int32_t)error->status);
 
     if (error->status != 0) {
-        command_dispatcher_on_op_error(claim.request_id, "READ_FAILED", "GATT read error");
+        command_dispatcher_on_gatt_error(claim.request_id, "READ_FAILED", "GATT read error", error->status);
         return 0;
     }
     uint16_t len = OS_MBUF_PKTLEN(attr->om);
@@ -699,7 +699,7 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     memset(s_pending.write_buf, 0, sizeof(s_pending.write_buf));   /* HLV-WIFI-008: never keep a written credential */
 
     if (error->status != 0) {
-        command_dispatcher_on_op_error(claim.request_id, "WRITE_FAILED", "GATT write error");
+        command_dispatcher_on_gatt_error(claim.request_id, "WRITE_FAILED", "GATT write error", error->status);
         return 0;
     }
     if (claim.op == BLE_CENTRAL_OP_SUBSCRIBE) {
@@ -1306,7 +1306,7 @@ static int read_long_cb(uint16_t conn_handle, const struct ble_gatt_error *error
     }
     set_state(BLE_CENTRAL_STATE_READY, "read_long_done", (int32_t)error->status);
     if (error->status != BLE_HS_EDONE) {
-        command_dispatcher_on_op_error(claim.request_id, "READ_FAILED", "GATT long read error");
+        command_dispatcher_on_gatt_error(claim.request_id, "READ_FAILED", "GATT long read error", error->status);
         return 0;
     }
     if (s_long_read_overflow) {

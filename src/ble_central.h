@@ -72,6 +72,9 @@ void command_dispatcher_on_subscribe_done(int64_t request_id, bool subscribed);
 /* HLV-WIFI-20261006-008: link encryption finished (status 0 = encrypted). */
 void command_dispatcher_on_enc_change(int status, bool encrypted, unsigned key_size);
 void command_dispatcher_on_op_error(int64_t request_id, const char *error_code, const char *detail);
+/* HLV-WIFI-20261009-013: as on_op_error, plus "gatt_status" (NimBLE status) and, for an ATT
+   error response, "att_error" (e.g. 0x0F Insufficient Encryption) in the error response. */
+void command_dispatcher_on_gatt_error(int64_t request_id, const char *error_code, const char *detail, int status);
 void command_dispatcher_on_op_timeout(int64_t request_id);
 void command_dispatcher_on_notification(uint16_t val_handle, const char *char_uuid, const uint8_t *data, size_t len, bool is_indication);
 

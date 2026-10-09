@@ -36,7 +36,9 @@ HLV_RESULT_ACCEPTED = 12
 HLV_RESULT_ENCRYPTION_REQUIRED = 18
 HLV_RESULT_WIFI_REJECTED = 19
 
-WIFI_BLE_VERSION = 1
+# 2 (HLV-WIFI-20261009-013): with the device's policy on, every Wi-Fi opcode except
+# WIFI_GET_CAPABILITIES, and the Snapshot read, need an encrypted link (v1: ADD / UPDATE only).
+WIFI_BLE_VERSION = 2
 WIFI_MAX_NETWORKS = 5
 WIFI_SSID_MAX = 32
 WIFI_PASS_MAX = 64
@@ -48,7 +50,10 @@ WIFI_RESULT_NAMES = ["OK", "INVALID_SSID", "INVALID_PASSWORD", "UNSUPPORTED_AUTH
                      "NOT_FOUND", "STORAGE_LOCKED", "SAVE_FAILED", "INVALID_ARG"]
 WIFI_STATE_NAMES = ["STOPPED", "NO_NETWORKS", "CONNECTING", "WAITING_IP", "CONNECTED", "BACKOFF"]
 
-CAP_CRED_REQUIRES_ENCRYPTION = 0x01
+CAP_REQUIRES_ENCRYPTION = 0x01
+# ATT error codes the Wi-Fi Snapshot read can return (Core spec Vol 3 Part F 3.4.1.1).
+ATT_INSUFFICIENT_AUTHORIZATION = 0x08
+ATT_INSUFFICIENT_ENCRYPTION = 0x0F
 CAP_CRED_ENCRYPTED_AT_REST = 0x02
 CAP_SNAPSHOT_CHAR = 0x04
 
@@ -72,6 +77,31 @@ def _check_password(password):
         raise ValueError(f"password too long ({len(password)} bytes, max {WIFI_PASS_MAX})")
     if any(c < 0x20 or c > 0x7E for c in password):
         raise ValueError("password contains a non-printable byte")
+
+
+def requires_encrypted_link(opcode, policy_on=True):
+    """Mirrors the firmware admission (PROTOCOL.md 19.2, version 2): every Wi-Fi opcode except
+    WIFI_GET_CAPABILITIES needs an encrypted link when the policy is on."""
+    return policy_on and opcode != HLV_OPCODE_WIFI_GET_CAPABILITIES
+
+
+def expected_admission(opcode, authorized, encrypted, policy_on=True):
+    """The BLE result the firmware gives before decoding anything: UNAUTHORIZED (2),
+    ENCRYPTION_REQUIRED (18), or None (admitted)."""
+    if not authorized:
+        return 2
+    if requires_encrypted_link(opcode, policy_on) and not encrypted:
+        return HLV_RESULT_ENCRYPTION_REQUIRED
+    return None
+
+
+def expected_snapshot_att_error(authorized, current_connection, encrypted, policy_on=True):
+    """Mirrors holter_ble_wifi_snapshot_access(): 0x0F before 0x08, None = readable."""
+    if policy_on and not encrypted:
+        return ATT_INSUFFICIENT_ENCRYPTION
+    if not authorized or not current_connection:
+        return ATT_INSUFFICIENT_AUTHORIZATION
+    return None
 
 
 def encode_wifi_add_payload(ssid, password, auth):
@@ -115,7 +145,7 @@ def decode_capabilities(inner):
         "version": inner[0],
         "max_networks": inner[1],
         "auth_mask": inner[2],
-        "cred_requires_encryption": bool(inner[3] & CAP_CRED_REQUIRES_ENCRYPTION),
+        "requires_encryption": bool(inner[3] & CAP_REQUIRES_ENCRYPTION),
         "cred_encrypted_at_rest": bool(inner[3] & CAP_CRED_ENCRYPTED_AT_REST),
         "snapshot_char": bool(inner[3] & CAP_SNAPSHOT_CHAR),
     }

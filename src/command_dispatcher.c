@@ -6,6 +6,7 @@
 #include "holterlev_protocol_ref.h"
 #include "file_transfer_hash.h"
 #include "file_integrity_diag.h"
+#include "host/ble_hs.h"   /* BLE_HS_ERR_ATT_BASE */
 
 #include <string.h>
 #include <stdlib.h>
@@ -285,6 +286,20 @@ void command_dispatcher_on_op_error(int64_t request_id, const char *error_code, 
         return;
     }
     protocol_json_send_error(request_id, error_code, detail);
+}
+
+void command_dispatcher_on_gatt_error(int64_t request_id, const char *error_code, const char *detail, int status)
+{
+    if (holterlev_client_owns_request(request_id)) {
+        holterlev_client_handle_op_error(request_id, error_code, detail);
+        return;
+    }
+    cJSON *extra = cJSON_CreateObject();
+    cJSON_AddNumberToObject(extra, "gatt_status", status);
+    if (status > BLE_HS_ERR_ATT_BASE && status < BLE_HS_ERR_ATT_BASE + 0x100) {
+        cJSON_AddNumberToObject(extra, "att_error", status - BLE_HS_ERR_ATT_BASE);
+    }
+    protocol_json_send_error_ex(request_id, error_code, detail, extra);
 }
 
 void command_dispatcher_on_op_timeout(int64_t request_id)

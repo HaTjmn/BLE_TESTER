@@ -22,8 +22,9 @@ Usage:
     python tools/holter_wifi_manage.py --port COM17 --mtu23 selftest --erase-wifi-config --log run.jsonl
 
 Options: --mtu23 keeps ATT MTU 23 (long write / long read are then used),
---no-pair skips LE Secure Connections pairing (ADD / UPDATE are then refused
-with ENCRYPTION_REQUIRED -- that is the point of the option).
+--no-pair skips LE Secure Connections pairing (every Wi-Fi command except caps
+is then refused with ENCRYPTION_REQUIRED and the Snapshot read with ATT 0x0F --
+protocol version 2, HLV-WIFI-20261009-013; that is the point of the option).
 
 `selftest` is the hardware checklist of HLV-WIFI-008: it ERASES the saved
 Wi-Fi networks (only those) and uses dummy networks / passwords only.
@@ -131,6 +132,18 @@ class WifiSession:
         r = self.client.send("read", timeout=10, characteristic=w.HLV_WIFI_SNAPSHOT_UUID, long=True, timeout_ms=8000)
         return bytes.fromhex(r["data_hex"])
 
+    def snapshot_att_error(self):
+        """Reads the Snapshot; returns None if readable, else the ATT error code the device sent
+        (BLE_TESTER reports it as "att_error"; HLV-WIFI-20261009-013)."""
+        try:
+            self.read_snapshot()
+            return None
+        except ControllerError as e:
+            att = (e.response or {}).get("att_error")
+            if att is None:
+                raise
+            return int(att)
+
     def snapshot_request(self, opcode):
         cr = self.request(opcode)
         if cr["phase"] != HLV_RESPONSE_PHASE_COMPLETED or cr["result_code"] != 0:
@@ -180,6 +193,23 @@ class Checks:
         return [w_ for ok, w_ in self.results if not ok]
 
 
+def plaintext_matrix_requests():
+    """One well-formed request per Wi-Fi opcode (dummy values). On a plaintext link all are refused
+    except CAPABILITIES, which changes nothing."""
+    return [
+        (w.HLV_OPCODE_WIFI_GET_CAPABILITIES, b""),
+        (w.HLV_OPCODE_WIFI_LIST, b""),
+        (w.HLV_OPCODE_WIFI_ADD, w.encode_wifi_add_payload(b"HLV-DUMMY-PLAIN", b"dummy-pass-plain", 1)),
+        (w.HLV_OPCODE_WIFI_UPDATE, w.encode_wifi_update_payload(1, b"dummy-pass-plain", 1)),
+        (w.HLV_OPCODE_WIFI_DELETE, w.encode_wifi_id_payload(1)),
+        (w.HLV_OPCODE_WIFI_CLEAR_ALL, w.WIFI_CLEAR_CONFIRM),
+        (w.HLV_OPCODE_WIFI_SET_PREFERRED, w.encode_wifi_id_payload(0)),
+        (w.HLV_OPCODE_WIFI_GET_STATUS, b""),
+        (w.HLV_OPCODE_WIFI_START, b""),
+        (w.HLV_OPCODE_WIFI_STOP, b""),
+    ]
+
+
 def dummy_networks():
     """Five dummy networks: the first uses the maximum SSID (32 B) and a 64-hex PSK
     (maximum request, 112 B) so the long write at MTU 23 is exercised."""
@@ -192,30 +222,33 @@ def dummy_networks():
 def selftest(client, mtu23, log_path):
     chk = Checks()
     s = WifiSession(client, mtu23=mtu23)
-    secrets = [p for _, p, _ in dummy_networks()] + [b"dummy-new-pw-3", b"dummy-pass-6th", b"dummy-pass-retry"]
+    secrets = [p for _, p, _ in dummy_networks()] + [b"dummy-new-pw-3", b"dummy-pass-6th", b"dummy-pass-retry",
+                                                      b"dummy-pass-plain"]
 
-    # 1. unauthorized
+    # 1-2. HLV-WIFI-20261009-013 (F2) plaintext matrix on the real device: every Wi-Fi opcode
+    #      before AUTH, then after AUTH on the unencrypted link; Snapshot read ATT errors.
     s.connect(authorize=False, pair=False)
-    cr = s.request(w.HLV_OPCODE_WIFI_LIST)
-    chk.check(cr["phase"] == HLV_RESPONSE_PHASE_REJECTED and cr["result_code"] == HLV_RESULT_UNAUTHORIZED,
-              "LIST before AUTH -> REJECTED UNAUTHORIZED")
-    try:
-        s.read_snapshot()
-        chk.check(False, "Snapshot read before AUTH is refused")
-    except ControllerError:
-        chk.check(True, "Snapshot read before AUTH is refused")
-    authenticate_raw(client, s.next_txn())
-
-    # 2. capabilities, unencrypted credential refused
+    for authorized in (False, True):
+        if authorized:
+            authenticate_raw(client, s.next_txn())
+        att = s.snapshot_att_error()
+        exp_att = w.expected_snapshot_att_error(authorized, True, encrypted=False)
+        chk.check(att == exp_att, f"plaintext Snapshot read, AUTH={authorized} -> ATT error {att!r} (expected {exp_att:#04x})")
+        for opcode, payload in plaintext_matrix_requests():
+            cr = s.request(opcode, payload)
+            expect = w.expected_admission(opcode, authorized, encrypted=False)
+            if expect is None:
+                ok = cr["phase"] == HLV_RESPONSE_PHASE_COMPLETED and cr["result_code"] == 0
+            else:
+                ok = cr["phase"] == HLV_RESPONSE_PHASE_REJECTED and cr["result_code"] == expect
+            chk.check(ok, f"plaintext opcode 0x{opcode:04x}, AUTH={authorized} -> phase {cr['phase']} result "
+                          f"{cr['result_code']} (expected {'COMPLETED OK' if expect is None else expect})")
     cr = s.request(w.HLV_OPCODE_WIFI_GET_CAPABILITIES)
     caps = w.decode_capabilities(cr["inner"]) if cr["phase"] == HLV_RESPONSE_PHASE_COMPLETED else {}
-    chk.check(caps.get("version") == 1 and caps.get("max_networks") == 5 and caps.get("snapshot_char"),
-              f"capabilities {caps}")
-    name, pw, auth = dummy_networks()[1]
-    cr = s.request(w.HLV_OPCODE_WIFI_ADD, w.encode_wifi_add_payload(name, pw, auth))
-    chk.check(cr["phase"] == HLV_RESPONSE_PHASE_REJECTED and cr["result_code"] == w.HLV_RESULT_ENCRYPTION_REQUIRED,
-              "ADD on an unencrypted link -> ENCRYPTION_REQUIRED")
+    chk.check(caps.get("version") == w.WIFI_BLE_VERSION and caps.get("max_networks") == 5 and caps.get("snapshot_char")
+              and caps.get("requires_encryption"), f"capabilities (discovery exception, plaintext) {caps}")
     s.pair()
+    chk.check(s.snapshot_att_error() is None, "Snapshot readable once AUTH + encrypted")
 
     # 3. clear, bad input, unknown opcode
     cr = s.request(w.HLV_OPCODE_WIFI_CLEAR_ALL, b"")
