@@ -69,6 +69,8 @@ void command_dispatcher_on_chr_disc_done(int64_t request_id, const ble_central_c
 void command_dispatcher_on_read_done(int64_t request_id, const uint8_t *data, size_t len);
 void command_dispatcher_on_write_done(int64_t request_id);
 void command_dispatcher_on_subscribe_done(int64_t request_id, bool subscribed);
+/* HLV-WIFI-20261006-008: link encryption finished (status 0 = encrypted). */
+void command_dispatcher_on_enc_change(int status, bool encrypted, unsigned key_size);
 void command_dispatcher_on_op_error(int64_t request_id, const char *error_code, const char *detail);
 void command_dispatcher_on_op_timeout(int64_t request_id);
 void command_dispatcher_on_notification(uint16_t val_handle, const char *char_uuid, const uint8_t *data, size_t len, bool is_indication);
@@ -111,6 +113,23 @@ bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char
 bool ble_central_subscribe_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
                                    bool indicate);
 bool ble_central_unsubscribe_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid);
+
+/*
+ * HLV-WIFI-20261006-008 additions (all opt-in; existing behaviour unchanged):
+ *  - read_start_ex(long_read=true): ATT long read (Read + Read Blob), up to
+ *    BLE_CENTRAL_MAX_READ_LEN bytes -- needed for values > MTU-3.
+ *  - write_start_ex(force_long=true): ATT long write (Prepare + Execute). A
+ *    write with response longer than MTU-3 always uses it (it used to fail).
+ *  - set_exchange_mtu(false): the next connection keeps ATT MTU 23.
+ *  - security_initiate(): LE Secure Connections pairing, Just Works, no
+ *    bonding; the outcome arrives as an "enc_change" event.
+ */
+bool ble_central_read_start_ex(int64_t request_id, uint32_t timeout_ms, const char *char_uuid, bool long_read);
+bool ble_central_write_start_ex(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
+                                const uint8_t *data, size_t len, bool with_response, bool force_long);
+void ble_central_set_exchange_mtu(bool exchange);
+int ble_central_security_initiate(void);
+bool ble_central_link_encrypted(void);
 
 void ble_central_clear_bonds(void);
 

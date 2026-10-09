@@ -347,6 +347,7 @@ static void cmd_controller_status(int64_t id, cJSON *root)
         cJSON_AddStringToObject(j, "peer_addr", ble_central_peer_addr_str());
         cJSON_AddStringToObject(j, "peer_name", ble_central_peer_name());
         cJSON_AddNumberToObject(j, "mtu", ble_central_negotiated_mtu());
+        cJSON_AddBoolToObject(j, "encrypted", ble_central_link_encrypted());   /* HLV-WIFI-008 */
     }
     cJSON_AddNumberToObject(j, "connection_generation", ble_central_connection_generation());
     protocol_json_send_ok(id, j);
@@ -670,6 +671,8 @@ static void cmd_connect(int64_t id, cJSON *root)
         protocol_json_send_error(id, "INVALID_STATE", "controller is not IDLE");
         return;
     }
+    /* HLV-WIFI-008: "exchange_mtu": false keeps ATT MTU 23 for this connection. */
+    ble_central_set_exchange_mtu(get_bool(root, "exchange_mtu", true));
     if (!ble_central_connect_start(id, timeout_ms, addr, name)) {
         protocol_json_send_error(id, "CONNECT_FAILED", "could not start connect");
     }
@@ -746,7 +749,8 @@ static void cmd_read(int64_t id, cJSON *root)
     const char *uuid;
     if (!require_string(id, root, "characteristic", &uuid)) return;
     uint32_t timeout_ms = optional_uint32(root, "timeout_ms", 5000);
-    if (!ble_central_read_start(id, timeout_ms, uuid)) {
+    bool long_read = get_bool(root, "long", false);   /* HLV-WIFI-008: Read Blob for values > MTU-3 */
+    if (!ble_central_read_start_ex(id, timeout_ms, uuid, long_read)) {
         send_reject_error(id);
     }
 }
@@ -759,6 +763,7 @@ static void cmd_write(int64_t id, cJSON *root)
     if (!require_string(id, root, "data_hex", &data_hex)) return;
     uint32_t timeout_ms = optional_uint32(root, "timeout_ms", 5000);
     bool with_response = get_bool(root, "with_response", true);
+    bool force_long = get_bool(root, "long", false);   /* HLV-WIFI-008: Prepare/Execute; automatic above MTU-3 */
 
     uint8_t buf[BLE_CENTRAL_MAX_READ_LEN];
     int len = protocol_json_hex_decode(data_hex, buf, sizeof(buf));
@@ -766,9 +771,10 @@ static void cmd_write(int64_t id, cJSON *root)
         protocol_json_send_error(id, "INVALID_ARGUMENT", "data_hex is not valid hex");
         return;
     }
-    if (!ble_central_write_start(id, timeout_ms, uuid, buf, (size_t)len, with_response)) {
+    if (!ble_central_write_start_ex(id, timeout_ms, uuid, buf, (size_t)len, with_response, force_long)) {
         send_reject_error(id);
     }
+    memset(buf, 0, sizeof(buf));   /* the payload may carry a credential; it is never echoed */
 }
 
 static void cmd_subscribe(int64_t id, cJSON *root)
@@ -816,6 +822,32 @@ static void cmd_wait_event(int64_t id, cJSON *root)
         }
     }
     protocol_json_send_error(id, "TIMEOUT", "no matching event within timeout_ms");
+}
+
+/* HLV-WIFI-20261006-008: start LE Secure Connections pairing (Just Works, no
+ * bonding). "ok" means started; the result is the "enc_change" event. */
+static void cmd_security_initiate(int64_t id, cJSON *root)
+{
+    (void)root;
+    int rc = ble_central_security_initiate();
+    if (rc != 0) {
+        char detail[40];
+        snprintf(detail, sizeof(detail), "ble_gap_security_initiate rc=%d", rc);
+        protocol_json_send_error(id, "SECURITY_FAILED", detail);
+        return;
+    }
+    protocol_json_send_ok(id, NULL);
+}
+
+void command_dispatcher_on_enc_change(int status, bool encrypted, unsigned key_size)
+{
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "status", status);
+    cJSON_AddBoolToObject(j, "encrypted", encrypted);
+    cJSON_AddNumberToObject(j, "key_size", key_size);
+    protocol_json_send_event("enc_change", j);
+    uint8_t b[3] = { (uint8_t)(status & 0xFF), (uint8_t)(encrypted ? 1 : 0), (uint8_t)key_size };
+    mirror_push("enc_change", NULL, b, sizeof(b));
 }
 
 static void cmd_clear_bonds(int64_t id, cJSON *root)
@@ -981,6 +1013,7 @@ void command_dispatcher_handle_line(char *line)
     else if (strcmp(cmd, "unsubscribe") == 0) cmd_unsubscribe(id, root);
     else if (strcmp(cmd, "wait_event") == 0) cmd_wait_event(id, root);
     else if (strcmp(cmd, "clear_bonds") == 0) cmd_clear_bonds(id, root);
+    else if (strcmp(cmd, "security_initiate") == 0) cmd_security_initiate(id, root);
     else if (strcmp(cmd, "reset_controller") == 0) cmd_reset_controller(id, root);
     else if (strcmp(cmd, "diag_disconnect") == 0) cmd_diag_disconnect(id, root);
     else if (strcmp(cmd, "diag_trace") == 0) cmd_diag_trace(id, root);

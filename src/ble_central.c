@@ -42,6 +42,10 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
  * lock as s_conn_handle, since they always change together. */
 static uint32_t s_connection_generation = 0;
 static uint16_t s_mtu = 23;
+static bool s_exchange_mtu_on_connect = true;      /* HLV-WIFI-008: false keeps ATT MTU 23 */
+static uint8_t s_long_read_buf[BLE_CENTRAL_MAX_READ_LEN];
+static size_t s_long_read_len = 0;
+static bool s_long_read_overflow = false;
 static char     s_peer_addr_str[18] = {0};
 static char     s_peer_name[32] = {0};
 
@@ -692,6 +696,7 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         return 0;
     }
     set_state(BLE_CENTRAL_STATE_READY, "write_done", (int32_t)error->status);
+    memset(s_pending.write_buf, 0, sizeof(s_pending.write_buf));   /* HLV-WIFI-008: never keep a written credential */
 
     if (error->status != 0) {
         command_dispatcher_on_op_error(claim.request_id, "WRITE_FAILED", "GATT write error");
@@ -833,7 +838,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             ble_gap_conn_find(s_conn_handle, &desc);
             addr_to_str(&desc.peer_id_addr, s_peer_addr_str, sizeof(s_peer_addr_str));
             strlcpy(s_peer_name, name_copy, sizeof(s_peer_name));
-            ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
+            if (s_exchange_mtu_on_connect) {
+                ble_gattc_exchange_mtu(s_conn_handle, mtu_cb, NULL);
+            }
+            s_exchange_mtu_on_connect = true;   /* one-shot: later connects exchange as before */
             command_dispatcher_on_connected(claim.request_id, s_peer_addr_str, s_peer_name);
         } else {
             set_state(BLE_CENTRAL_STATE_IDLE, "gap_connect_failed", (int32_t)event->connect.status);
@@ -923,6 +931,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         s_mtu = event->mtu.value;
         return 0;
 
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        struct ble_gap_conn_desc desc;
+        bool enc = false;
+        unsigned ks = 0;
+        if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+            enc = desc.sec_state.encrypted != 0;
+            ks = desc.sec_state.key_size;
+        }
+        command_dispatcher_on_enc_change(event->enc_change.status, enc, ks);
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
+
     default:
         return 0;
     }
@@ -1010,6 +1038,12 @@ void ble_central_init(void)
     ble_hs_cfg.store_read_cb = ble_store_config_read;
     ble_hs_cfg.store_write_cb = ble_store_config_write;
     ble_hs_cfg.store_delete_cb = ble_store_config_delete;
+    /* HLV-WIFI-20261006-008: pairing only on request (security_initiate):
+       LE Secure Connections, Just Works (no IO), no bonding -- nothing stored. */
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
@@ -1244,7 +1278,51 @@ bool ble_central_disc_characteristics_start(int64_t request_id, uint32_t timeout
     return true;
 }
 
+/* HLV-WIFI-20261006-008: ATT long read. NimBLE calls back once per fragment
+ * (status 0 + attr), then once with BLE_HS_EDONE; only that last call (or an
+ * error) completes the pending operation. */
+static int read_long_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    if (error->status == 0 && attr != NULL) {
+        if (!op_is_current(gen)) {
+            return BLE_HS_EDONE;   /* stale: stop the procedure */
+        }
+        uint16_t n = OS_MBUF_PKTLEN(attr->om);
+        if (s_long_read_len + n > sizeof(s_long_read_buf)) {
+            s_long_read_overflow = true;
+            n = (uint16_t)(sizeof(s_long_read_buf) - s_long_read_len);
+        }
+        os_mbuf_copydata(attr->om, 0, n, &s_long_read_buf[s_long_read_len]);
+        s_long_read_len += n;
+        return 0;
+    }
+    pending_claim_t claim;
+    if (!try_claim_pending_completion(gen, CLAIM_REASON_COMPLETED, &claim)) {
+        s_late_completions_ignored++;
+        return 0;
+    }
+    set_state(BLE_CENTRAL_STATE_READY, "read_long_done", (int32_t)error->status);
+    if (error->status != BLE_HS_EDONE) {
+        command_dispatcher_on_op_error(claim.request_id, "READ_FAILED", "GATT long read error");
+        return 0;
+    }
+    if (s_long_read_overflow) {
+        command_dispatcher_on_op_error(claim.request_id, "READ_FAILED", "long read value exceeds 512 bytes");
+        return 0;
+    }
+    command_dispatcher_on_read_done(claim.request_id, s_long_read_buf, s_long_read_len);
+    return 0;
+}
+
 bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid)
+{
+    return ble_central_read_start_ex(request_id, timeout_ms, char_uuid, false);
+}
+
+bool ble_central_read_start_ex(int64_t request_id, uint32_t timeout_ms, const char *char_uuid, bool long_read)
 {
     if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, char_uuid); return false; }
     if (s_state != BLE_CENTRAL_STATE_READY) {
@@ -1256,7 +1334,14 @@ bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char 
     if (handle == 0xFFFF) { set_reject(BLE_CENTRAL_REJECT_CHARACTERISTIC_NOT_DISCOVERED, char_uuid); return false; }
 
     uint32_t gen = begin_pending(BLE_CENTRAL_OP_READ, request_id, timeout_ms);
-    int rc = ble_gattc_read(s_conn_handle, handle, read_cb, (void *)(uintptr_t)gen);
+    int rc;
+    if (long_read) {
+        s_long_read_len = 0;
+        s_long_read_overflow = false;
+        rc = ble_gattc_read_long(s_conn_handle, handle, 0, read_long_cb, (void *)(uintptr_t)gen);
+    } else {
+        rc = ble_gattc_read(s_conn_handle, handle, read_cb, (void *)(uintptr_t)gen);
+    }
     if (rc != 0) {
         clear_pending();
         set_reject(BLE_CENTRAL_REJECT_CENTRAL_NOT_READY, char_uuid);
@@ -1267,6 +1352,12 @@ bool ble_central_read_start(int64_t request_id, uint32_t timeout_ms, const char 
 
 bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
                               const uint8_t *data, size_t len, bool with_response)
+{
+    return ble_central_write_start_ex(request_id, timeout_ms, char_uuid, data, len, with_response, false);
+}
+
+bool ble_central_write_start_ex(int64_t request_id, uint32_t timeout_ms, const char *char_uuid,
+                                const uint8_t *data, size_t len, bool with_response, bool force_long)
 {
     if (s_pending.active) { set_reject(BLE_CENTRAL_REJECT_GATT_OPERATION_PENDING, char_uuid); return false; }
     if (s_state != BLE_CENTRAL_STATE_READY) {
@@ -1283,7 +1374,14 @@ bool ble_central_write_start(int64_t request_id, uint32_t timeout_ms, const char
     s_pending.write_len = len;
 
     int rc;
-    if (with_response) {
+    const bool use_long = with_response && (force_long || len > (size_t)(s_mtu - 3));
+    if (use_long) {
+        /* HLV-WIFI-20261006-008: Prepare Write fragments + Execute; the peer
+           applies the value only after Execute. The mbuf is consumed by NimBLE. */
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(s_pending.write_buf, (uint16_t)len);
+        rc = (om == NULL) ? BLE_HS_ENOMEM
+                          : ble_gattc_write_long(s_conn_handle, handle, 0, om, write_cb, (void *)(uintptr_t)gen);
+    } else if (with_response) {
         rc = ble_gattc_write_flat(s_conn_handle, handle, s_pending.write_buf, len,
                                     write_cb, (void *)(uintptr_t)gen);
     } else {
@@ -1346,6 +1444,26 @@ bool ble_central_unsubscribe_start(int64_t request_id, uint32_t timeout_ms, cons
 {
     uint8_t val[2] = { 0x00, 0x00 };
     return subscribe_common(request_id, timeout_ms, char_uuid, val, BLE_CENTRAL_OP_UNSUBSCRIBE);
+}
+
+void ble_central_set_exchange_mtu(bool exchange)
+{
+    s_exchange_mtu_on_connect = exchange;
+}
+
+int ble_central_security_initiate(void)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return BLE_HS_ENOTCONN;
+    }
+    return ble_gap_security_initiate(s_conn_handle);
+}
+
+bool ble_central_link_encrypted(void)
+{
+    struct ble_gap_conn_desc desc;
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && ble_gap_conn_find(s_conn_handle, &desc) == 0 &&
+           desc.sec_state.encrypted != 0;
 }
 
 void ble_central_clear_bonds(void)
