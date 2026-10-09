@@ -13,6 +13,16 @@ import queue
 import serial
 
 
+def redact_request(request):
+    """A copy of a controller request with every payload field replaced by
+    "<redacted N bytes>" (HLV-WIFI-20261006-008: never log a credential)."""
+    out = dict(request)
+    for key in ("data_hex",):
+        if key in out and isinstance(out[key], str):
+            out[key] = f"<redacted {len(out[key]) // 2} bytes>"
+    return out
+
+
 class ControllerError(Exception):
     """Raised when the controller returns status:"error", or when a
     host-side timeout elapses waiting for a response."""
@@ -159,10 +169,16 @@ class HolterBLEClient:
                 elif obj.get("type") == "event":
                     self._events.put(obj)
 
-    def send(self, cmd, timeout=None, **fields):
+    def send(self, cmd, timeout=None, sensitive=False, **fields):
         """Sends one command and blocks for its terminal response.
         Raises ControllerError on status:"error" or on host-side timeout.
         Returns the response dict (status:"ok") on success.
+
+        sensitive=True (HLV-WIFI-20261006-008): the request carries a
+        credential (e.g. a WIFI_ADD / WIFI_UPDATE Control Point write). Its
+        data_hex is replaced by a length-only placeholder in the log file
+        and in any ControllerError, so a password never lands in a log,
+        traceback or report. The serial line itself must carry it.
         """
         timeout = self._default_timeout if timeout is None else timeout
         with self._lock:
@@ -174,6 +190,8 @@ class HolterBLEClient:
         request = {"id": req_id, "cmd": cmd}
         request.update(fields)
         line = json.dumps(request)
+        if sensitive:
+            request = redact_request(request)
         self._log("send", request)
         self._ser.write((line + "\n").encode("utf-8"))
 

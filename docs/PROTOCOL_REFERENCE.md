@@ -89,5 +89,22 @@ unsynchronized with command completion), `holter_get_status`,
 or timeout).
 
 Not implemented (no live BLE contract to bind to yet, per the firmware's
-own PROTOCOL.md Section 10): telemetry/ECG preview, Wi-Fi provisioning,
-OTA, bonding-based reconnection semantics beyond raw `clear_bonds`.
+own PROTOCOL.md Section 10): telemetry/ECG preview, OTA, bonding-based
+reconnection semantics beyond raw `clear_bonds`.
+
+### HLV-WIFI-20261006-008 additions (Wi-Fi management over BLE)
+
+These are all opt-in, and existing commands behave as before:
+
+- **`read`:** `"long": true` performs an ATT long read (Read + Read Blob) of up to 512 bytes. It is needed for values longer than MTU-3, such as HolterLEV's Wi-Fi Snapshot at MTU 23.
+- **`write`:** `"long": true` forces an ATT long write (Prepare Write + Execute Write). A write with response that is longer than MTU-3 now uses a long write automatically; before, it failed. The written payload is wiped after the write and is never echoed.
+- **`connect`:** `"exchange_mtu": false` skips the MTU exchange for that one connection, so it stays at ATT MTU 23.
+- **`security_initiate`:** starts pairing with LE Secure Connections, Just Works, no bonding. `ok` only means the pairing has started. The outcome arrives as the event `enc_change` `{status, encrypted, key_size}` and is mirrored for `wait_event`.
+- **`controller_status`:** now also reports `encrypted`.
+
+Host side:
+- `tools/holter_wifi_protocol.py`: the codec of HolterLEV PROTOCOL.md Section 19.
+- `tools/holter_wifi_manage.py`: the CLI, plus the `selftest` hardware checklist.
+- `tools/test_holter_wifi_protocol.py`: offline tests, checked against golden vectors from the firmware codec.
+
+`HolterBLEClient.send(..., sensitive=True)` logs `data_hex` as `<redacted N bytes>` and keeps it out of `ControllerError`. The Wi-Fi tool uses it for every ADD / UPDATE. Passwords are taken from `HLV_WIFI_PASSWORD` or a no-echo prompt, never from the command line.
