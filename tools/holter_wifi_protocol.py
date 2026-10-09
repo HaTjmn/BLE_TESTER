@@ -37,7 +37,8 @@ HLV_RESULT_ENCRYPTION_REQUIRED = 18
 HLV_RESULT_WIFI_REJECTED = 19
 
 # 2 (HLV-WIFI-20261009-013): with the device's policy on, every Wi-Fi opcode except
-# WIFI_GET_CAPABILITIES, and the Snapshot read, need an encrypted link (v1: ADD / UPDATE only).
+# WIFI_GET_CAPABILITIES (the discovery exception) needs AUTH and an encrypted link, and every
+# Snapshot read needs an encrypted link and AUTH (v1: encryption for ADD / UPDATE only).
 WIFI_BLE_VERSION = 2
 WIFI_MAX_NETWORKS = 5
 WIFI_SSID_MAX = 32
